@@ -1598,6 +1598,67 @@ bool IsAllowedRTICommand(std::string const& command)
     return false;
 }
 
+bool IsAllowedCombatCommand(std::string const& command)
+{
+    std::string const normalized = ToUpper(Trim(command));
+
+    static std::set<std::string> const allowed =
+    {
+        "CO +FOCUS",
+        "CO -FOCUS",
+        "CO +DPS ASSIST",
+        "CO -DPS ASSIST",
+        "CO +AOE",
+        "CO -AOE",
+        "CO +DPS AOE",
+        "CO -DPS AOE",
+        "CO +TANK ASSIST",
+        "CO -TANK ASSIST",
+        "CO +WAIT FOR ATTACK",
+        "CO -WAIT FOR ATTACK"
+    };
+
+    if (allowed.find(normalized) != allowed.end())
+        return true;
+
+    static std::string const waitPrefix = "WAIT FOR ATTACK TIME ";
+    if (normalized.rfind(waitPrefix, 0) != 0)
+        return false;
+
+    std::string const value = Trim(normalized.substr(waitPrefix.size()));
+    if (value.empty())
+        return false;
+
+    uint32 seconds = 0;
+    for (char c : value)
+    {
+        if (!std::isdigit(static_cast<unsigned char>(c)))
+            return false;
+
+        seconds = (seconds * 10) + static_cast<uint32>(c - '0');
+        if (seconds > 60)
+            return false;
+    }
+
+    return true;
+}
+
+std::string NormalizeCombatCommand(std::string const& command)
+{
+    std::string const trimmed = Trim(command);
+    std::string const normalized = ToUpper(trimmed);
+
+    // Backward compatibility with the first addon patch.
+    // Playerbots exposes the strategy as "aoe", not "dps aoe".
+    if (normalized == "CO +DPS AOE")
+        return "co +aoe";
+
+    if (normalized == "CO -DPS AOE")
+        return "co -aoe";
+
+    return trimmed;
+}
+
 bool BotMatchesRTIScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
 {
     if (!requester || !bot)
@@ -1625,12 +1686,36 @@ bool BotMatchesRTIScope(Player* requester, Player* bot, std::string const& scope
     return false;
 }
 
+bool BotMatchesCombatScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
+{
+    if (!requester || !bot)
+        return false;
+
+    if (scope == "ALL" || scope == "RAID")
+        return true;
+
+    if (scope == "GROUP" || scope == "PARTY")
+    {
+        if (!target.empty())
+            return BotMatchesRTIScope(requester, bot, "GROUP", target);
+
+        Group* const group = requester->GetGroup();
+        if (!group)
+            return false;
+
+        return bot->GetGroup() == group;
+    }
+
+    return BotMatchesRTIScope(requester, bot, scope, target);
+}
+
 void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
     std::string const scope = ToUpper(Trim(scopeValue));
     std::string const target = Trim(UrlDecodeField(encodedTarget));
     std::string const token = Trim(requestToken);
-    std::string const command = Trim(UrlDecodeField(encodedCommand));
+    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const command = NormalizeCombatCommand(rawCommand);
     uint32 executed = 0;
 
     PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
@@ -1655,6 +1740,39 @@ void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scop
         << kFieldSeparator << UrlEncodeField(command);
 
     SendAddonPacket(requester, replyType, "RTI_ACK", payload.str());
+}
+
+void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const command = NormalizeCombatCommand(rawCommand);
+    uint32 executed = 0;
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (mgr && IsAllowedCombatCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    {
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+        {
+            Player* const bot = it->second;
+            if (!BotMatchesCombatScope(requester, bot, scope, target))
+                continue;
+
+            if (ExecuteSilentBotCommand(requester, bot, command))
+                ++executed;
+        }
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << executed
+        << kFieldSeparator << UrlEncodeField(command);
+
+    SendAddonPacket(requester, replyType, "COMBAT_ACK", payload.str());
 }
 
 ChatMsg NormalizeReplyChatType(uint32 type)
@@ -2023,6 +2141,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "COMBAT")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunCombatCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
+            return true;
+        }
+
         return false;
     }
 
@@ -2037,6 +2165,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const commandRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             RunOutfitCommand(player, replyType, botRequest.first, tokenRequest.first, commandRequest.first, commandRequest.second);
+            return true;
+        }
+
+        if (requestType == "COMBAT")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunCombatCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
