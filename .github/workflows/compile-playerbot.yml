@@ -1,15 +1,29 @@
 name: Compile against AzerothCore Playerbot
 
 on:
-  push:
-    branches:
-      - main
-      - master
-  pull_request:
   workflow_dispatch:
+    inputs:
+      target_os:
+        description: "OS à compiler"
+        required: true
+        default: "linux"
+        type: choice
+        options:
+          - linux
+          - windows
+          - macos
+          - all
+      core_ref:
+        description: "Branche AzerothCore Playerbot"
+        required: true
+        default: "Playerbot"
+      playerbots_ref:
+        description: "Branche mod-playerbots"
+        required: true
+        default: "master"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.target_os }}
   cancel-in-progress: true
 
 permissions:
@@ -19,20 +33,34 @@ jobs:
   linux:
     name: Linux / AzerothCore Playerbot
     runs-on: ubuntu-24.04
+    if: ${{ inputs.target_os == 'linux' || inputs.target_os == 'all' }}
 
     steps:
       - name: Checkout AzerothCore Playerbot
         uses: actions/checkout@v4
         with:
           repository: mod-playerbots/azerothcore-wotlk
-          ref: Playerbot
+          ref: ${{ inputs.core_ref }}
           path: azerothcore
           submodules: recursive
+
+      - name: Checkout mod-playerbots
+        uses: actions/checkout@v4
+        with:
+          repository: mod-playerbots/mod-playerbots
+          ref: ${{ inputs.playerbots_ref }}
+          path: azerothcore/modules/mod-playerbots
 
       - name: Checkout mod-multibot-bridge
         uses: actions/checkout@v4
         with:
           path: azerothcore/modules/mod-multibot-bridge
+
+      - name: Verify Playerbots dependency
+        shell: bash
+        run: |
+          test -d azerothcore/modules/mod-playerbots
+          find azerothcore/modules/mod-playerbots -name "ChatHelper.h" -print -quit | grep -q .
 
       - name: Install Linux requirements
         run: |
@@ -55,6 +83,7 @@ jobs:
   windows:
     name: Windows / AzerothCore Playerbot
     runs-on: windows-latest
+    if: ${{ inputs.target_os == 'windows' || inputs.target_os == 'all' }}
 
     env:
       BOOST_ROOT: 'C:\local\boost_1_82_0'
@@ -64,14 +93,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: mod-playerbots/azerothcore-wotlk
-          ref: Playerbot
+          ref: ${{ inputs.core_ref }}
           path: azerothcore
           submodules: recursive
+
+      - name: Checkout mod-playerbots
+        uses: actions/checkout@v4
+        with:
+          repository: mod-playerbots/mod-playerbots
+          ref: ${{ inputs.playerbots_ref }}
+          path: azerothcore/modules/mod-playerbots
 
       - name: Checkout mod-multibot-bridge
         uses: actions/checkout@v4
         with:
           path: azerothcore/modules/mod-multibot-bridge
+
+      - name: Verify Playerbots dependency
+        shell: bash
+        run: |
+          test -d azerothcore/modules/mod-playerbots
+          find azerothcore/modules/mod-playerbots -name "ChatHelper.h" -print -quit | grep -q .
 
       - name: Move repo to short path
         shell: bash
@@ -100,20 +142,34 @@ jobs:
   macos:
     name: macOS / AzerothCore Playerbot
     runs-on: macos-14
+    if: ${{ inputs.target_os == 'macos' || inputs.target_os == 'all' }}
 
     steps:
       - name: Checkout AzerothCore Playerbot
         uses: actions/checkout@v4
         with:
           repository: mod-playerbots/azerothcore-wotlk
-          ref: Playerbot
+          ref: ${{ inputs.core_ref }}
           path: azerothcore
           submodules: recursive
+
+      - name: Checkout mod-playerbots
+        uses: actions/checkout@v4
+        with:
+          repository: mod-playerbots/mod-playerbots
+          ref: ${{ inputs.playerbots_ref }}
+          path: azerothcore/modules/mod-playerbots
 
       - name: Checkout mod-multibot-bridge
         uses: actions/checkout@v4
         with:
           path: azerothcore/modules/mod-multibot-bridge
+
+      - name: Verify Playerbots dependency
+        shell: bash
+        run: |
+          test -d azerothcore/modules/mod-playerbots
+          find azerothcore/modules/mod-playerbots -name "ChatHelper.h" -print -quit | grep -q .
 
       - name: Cache ccache
         uses: actions/cache@v4
