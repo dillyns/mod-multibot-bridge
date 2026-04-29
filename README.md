@@ -117,10 +117,9 @@ The bridge then answers with structured payloads that the addon can consume dire
 
 ## Server
 
-- [`AzerothCore WotLK`](https://github.com/mod-playerbots/azerothcore-wotlk/tree/Playerbot).
+- AzerothCore WotLK.
 - AzerothCore source build environment.
-- [`mod-playerbots`](https://github.com/mod-playerbots/mod-playerbots).
-- [`MultiBot-Chatless`](https://github.com/Wishmaster117/MultiBot-Chatless).
+- `mod-playerbots` installed and working.
 - Ability to rebuild the server after adding a module.
 
 ## Client
@@ -360,6 +359,10 @@ The exact payloads are consumed internally by the MultiBot addon.
   <tr>
     <td><code>GET~OUTFITS</code></td>
     <td>Refresh outfit sets and bridge outfit actions.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~LOOT</code></td>
+    <td>Run whitelist-only loot rules and loot list commands without addon-side chat parsing.</td>
   </tr>
 </table>
 

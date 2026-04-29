@@ -1736,6 +1736,33 @@ std::string NormalizePositionCommand(std::string const& command)
     return out.str();
 }
 
+std::string NormalizeLootCommand(std::string const& command)
+{
+    std::string normalized = Trim(command);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c)
+    {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    return normalized;
+}
+
+bool IsAllowedLootCommand(std::string const& command)
+{
+    static std::set<std::string> const allowed =
+    {
+        "nc +loot",
+        "nc -loot",
+        "ll all",
+        "ll normal",
+        "ll gray",
+        "ll quest",
+        "ll skill"
+    };
+
+    return allowed.find(Trim(command)) != allowed.end();
+}
+
 bool BotMatchesRTIScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
 {
     if (!requester || !bot)
@@ -1883,6 +1910,39 @@ void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const&
         << kFieldSeparator << UrlEncodeField(command);
 
     SendAddonPacket(requester, replyType, "POSITION_ACK", payload.str());
+}
+
+void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const command = NormalizeLootCommand(rawCommand);
+    uint32 executed = 0;
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (mgr && IsAllowedLootCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    {
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+        {
+            Player* const bot = it->second;
+            if (!BotMatchesCombatScope(requester, bot, scope, target))
+                continue;
+
+            if (ExecuteSilentBotCommand(requester, bot, command))
+                ++executed;
+        }
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << executed
+        << kFieldSeparator << UrlEncodeField(command);
+
+    SendAddonPacket(requester, replyType, "LOOT_ACK", payload.str());
 }
 
 ChatMsg NormalizeReplyChatType(uint32 type)
@@ -2285,6 +2345,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
 
             RunPositionCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
+            return true;
+        }
+
+        if (requestType == "LOOT")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunLootCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
