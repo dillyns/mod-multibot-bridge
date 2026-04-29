@@ -11,6 +11,7 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "Playerbots.h"
+#include "AiObjectContext.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SpellMgr.h"
@@ -1598,6 +1599,45 @@ bool IsAllowedRTICommand(std::string const& command)
     return false;
 }
 
+bool IsAllowedPositionCommand(std::string const& command)
+{
+    return command == "disperse disable" || command.rfind("disperse set ", 0) == 0;
+}
+
+bool ApplyNativeDisperseCommand(Player* bot, std::string const& command)
+{
+    if (!bot)
+        return false;
+
+    PlayerbotAI* const ai = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!ai || !ai->GetAiObjectContext())
+        return false;
+
+    float distance = 0.0f;
+
+    if (command != "disperse disable")
+    {
+        std::string const prefix = "disperse set ";
+        std::string const valueText = Trim(command.substr(prefix.size()));
+
+        char* end = nullptr;
+        double const value = std::strtod(valueText.c_str(), &end);
+        if (!end || *end != '\0' || value <= 0.0 || value > 100.0)
+            return false;
+
+        distance = static_cast<float>(value);
+    }
+
+    AiObjectContext* const context = ai->GetAiObjectContext();
+    auto* const disperseDistance = context->GetValue<float>("disperse distance");
+    if (!disperseDistance)
+        return false;
+
+    disperseDistance->Set(distance);
+
+    return true;
+}
+
 bool IsAllowedCombatCommand(std::string const& command)
 {
     std::string const normalized = ToUpper(Trim(command));
@@ -1665,6 +1705,35 @@ std::string NormalizeCombatCommand(std::string const& command)
         return "co -aoe";
 
     return trimmed;
+}
+
+std::string NormalizePositionCommand(std::string const& command)
+{
+    std::string normalized = Trim(command);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c)
+    {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (normalized == "disperse disable")
+        return normalized;
+
+    std::string const prefix = "disperse set ";
+    if (normalized.rfind(prefix, 0) != 0)
+        return "";
+
+    std::string const valueText = Trim(normalized.substr(prefix.size()));
+    if (valueText.empty())
+        return "";
+
+    char* end = nullptr;
+    double const value = std::strtod(valueText.c_str(), &end);
+    if (!end || *end != '\0' || value <= 0.0 || value > 100.0)
+        return "";
+
+    std::ostringstream out;
+    out << "disperse set " << value;
+    return out.str();
 }
 
 bool BotMatchesRTIScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
@@ -1781,6 +1850,39 @@ void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& s
         << kFieldSeparator << UrlEncodeField(command);
 
     SendAddonPacket(requester, replyType, "COMBAT_ACK", payload.str());
+}
+
+void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
+{
+    std::string const scope = ToUpper(Trim(scopeValue));
+    std::string const target = Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Trim(requestToken);
+    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const command = NormalizePositionCommand(rawCommand);
+    uint32 executed = 0;
+
+    PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(requester);
+    if (mgr && IsAllowedPositionCommand(command) && (scope == "ALL" || scope == "RAID" || scope == "GROUP" || scope == "PARTY" || scope == "BOT"))
+    {
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+        {
+            Player* const bot = it->second;
+            if (!BotMatchesCombatScope(requester, bot, scope, target))
+                continue;
+
+            if (ApplyNativeDisperseCommand(bot, command))
+                ++executed;
+        }
+    }
+
+    std::ostringstream payload;
+    payload << scope
+        << kFieldSeparator << UrlEncodeField(target)
+        << kFieldSeparator << token
+        << kFieldSeparator << executed
+        << kFieldSeparator << UrlEncodeField(command);
+
+    SendAddonPacket(requester, replyType, "POSITION_ACK", payload.str());
 }
 
 ChatMsg NormalizeReplyChatType(uint32 type)
@@ -2173,6 +2275,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
 
             RunCombatCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
+            return true;
+        }
+
+        if (requestType == "POSITION")
+        {
+            std::pair<std::string, std::string> const scopeSplit = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const targetSplit = SplitOnce(scopeSplit.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenSplit = SplitOnce(targetSplit.second, kFieldSeparator);
+
+            RunPositionCommand(player, replyType, scopeSplit.first, targetSplit.first, tokenSplit.first, tokenSplit.second);
             return true;
         }
 
