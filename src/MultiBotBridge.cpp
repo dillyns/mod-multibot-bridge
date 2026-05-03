@@ -17,6 +17,7 @@
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "Spell.h"
 #include "SpellMgr.h"
 #include "Unit.h"
 #include "World.h"
@@ -50,6 +51,7 @@ std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
+void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
 uint32 GetPct(uint32 current, uint32 max);
 
 std::string Trim(std::string const& value)
@@ -1300,6 +1302,146 @@ std::string BuildRecipeMaterialsPayload(SpellInfo const* spellInfo, std::map<uin
     return materials.str();
 }
 
+uint32 GetRecipeCreatedItemId(SpellInfo const* spellInfo)
+{
+    if (!spellInfo)
+        return 0;
+
+    for (uint32 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+        if (spellInfo->Effects[effectIndex].Effect == SPELL_EFFECT_CREATE_ITEM && spellInfo->Effects[effectIndex].ItemType > 0)
+            return spellInfo->Effects[effectIndex].ItemType;
+
+    return 0;
+}
+
+bool IsKnownActiveBotSpell(Player* bot, uint32 spellId)
+{
+    if (!bot || !spellId)
+        return false;
+
+    PlayerSpellMap::const_iterator const it = bot->GetSpellMap().find(spellId);
+    if (it == bot->GetSpellMap().end() || !it->second)
+        return false;
+
+    if (it->second->State == PLAYERSPELL_REMOVED || !it->second->Active)
+        return false;
+
+    return (it->second->specMask & bot->GetActiveSpecMask()) != 0;
+}
+
+std::string GetSpellCastFailureReason(SpellCastResult result)
+{
+    switch (result)
+    {
+        case SPELL_CAST_OK:
+            return "OK";
+        case SPELL_FAILED_REQUIRES_SPELL_FOCUS:
+            return "REQUIRES_SPELL_FOCUS";
+        case SPELL_FAILED_REQUIRES_AREA:
+            return "REQUIRES_AREA";
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS_MAINHAND:
+        case SPELL_FAILED_EQUIPPED_ITEM_CLASS_OFFHAND:
+            return "MISSING_TOOLS";
+        case SPELL_FAILED_MOVING:
+            return "MOVING";
+        case SPELL_FAILED_NOT_STANDING:
+            return "NOT_STANDING";
+        case SPELL_FAILED_NOT_READY:
+        case SPELL_FAILED_SPELL_IN_PROGRESS:
+            return "NOT_READY";
+        case SPELL_FAILED_OUT_OF_RANGE:
+            return "OUT_OF_RANGE";
+        case SPELL_FAILED_TRY_AGAIN:
+            return "TRY_AGAIN";
+        default:
+            std::ostringstream reason;
+            reason << "CAST_FAILED_" << static_cast<uint32>(result);
+            return reason.str();
+    }
+}
+
+std::string ValidateProfessionRecipeCraft(Player* bot, uint32 skillId, uint32 spellId, uint32 expectedItemId, uint32& actualItemId)
+{
+    actualItemId = expectedItemId;
+
+    if (!bot)
+        return "NO_BOT";
+
+    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
+    if (!botAI)
+        return "NO_AI";
+
+    if (!skillId || !spellId)
+        return "BAD_REQUEST";
+
+    if (!IsKnownActiveBotSpell(bot, spellId))
+        return "UNKNOWN_RECIPE";
+
+    SkillLineAbilityEntry const* const skillLine = GetSkillLineAbilityForSpell(spellId);
+    if (!skillLine || skillLine->SkillLine != skillId)
+        return "SKILL_MISMATCH";
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || spellInfo->IsPassive())
+        return "BAD_RECIPE";
+
+    actualItemId = GetRecipeCreatedItemId(spellInfo);
+    if (expectedItemId && actualItemId && expectedItemId != actualItemId)
+        return "ITEM_MISMATCH";
+
+    uint32 craftable = 0;
+    BuildRecipeMaterialsPayload(spellInfo, BuildBotInventoryItemCounts(bot), craftable);
+    if (!craftable)
+        return "NO_MATERIALS";
+
+    return "OK";
+}
+
+std::string CastProfessionRecipe(Player* bot, uint32 spellId)
+{
+    if (!bot || !spellId)
+        return "BAD_REQUEST";
+
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo)
+        return "BAD_RECIPE";
+
+    if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
+        return "LOST_CONTROL";
+
+    if (bot->IsFlying() || bot->HasUnitState(UNIT_STATE_IN_FLIGHT))
+        return "IN_FLIGHT";
+
+    if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
+        return "CHANNELING";
+
+    if (bot->HasSpellCooldown(spellId))
+        return "NOT_READY";
+
+    if (!bot->IsStandState())
+    {
+        bot->SetStandState(UNIT_STAND_STATE_STAND);
+        return "NOT_STANDING";
+    }
+
+    uint32 const castTime = !spellInfo->IsChanneled() ? spellInfo->CalcCastTime(bot) : spellInfo->GetDuration();
+    if ((castTime || spellInfo->IsAutoRepeatRangedSpell()) && bot->isMoving())
+        return "MOVING";
+
+    Spell* const spell = new Spell(bot, spellInfo, TRIGGERED_NONE);
+    SpellCastTargets targets;
+    if (spellInfo->Targets & TARGET_FLAG_DEST_LOCATION)
+        targets.SetDst(*bot);
+    else if (spellInfo->Targets & TARGET_FLAG_SOURCE_LOCATION)
+        targets.SetDst(*bot);
+    else
+        targets.SetUnitTarget(bot);
+
+    SpellCastResult const result = spell->prepare(&targets);
+    return GetSpellCastFailureReason(result);
+}
+
 std::vector<ProfessionRecipeEntryData> BuildProfessionRecipeEntries(Player* bot, uint32 skillId)
 {
     std::vector<ProfessionRecipeEntryData> entries;
@@ -1338,9 +1480,7 @@ std::vector<ProfessionRecipeEntryData> BuildProfessionRecipeEntries(Player* bot,
         entry.difficulty = GetRecipeDifficulty(bot, skillLine);
         entry.materials = BuildRecipeMaterialsPayload(spellInfo, itemCounts, entry.craftable);
 
-        for (uint32 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
-            if (spellInfo->Effects[effectIndex].Effect == SPELL_EFFECT_CREATE_ITEM && spellInfo->Effects[effectIndex].ItemType > 0)
-                entry.itemId = spellInfo->Effects[effectIndex].ItemType;
+        entry.itemId = GetRecipeCreatedItemId(spellInfo);
 
         entries.push_back(entry);
     }
@@ -2054,6 +2194,34 @@ bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& 
 
     botAI->HandleCommand(CHAT_MSG_WHISPER, command, requester);
     return true;
+}
+
+void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    uint32 const skillId = static_cast<uint32>(std::strtoul(Trim(skillIdValue).c_str(), nullptr, 10));
+    uint32 const spellId = static_cast<uint32>(std::strtoul(Trim(spellIdValue).c_str(), nullptr, 10));
+    uint32 const expectedItemId = static_cast<uint32>(std::strtoul(Trim(itemIdValue).c_str(), nullptr, 10));
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    uint32 actualItemId = expectedItemId;
+    std::string result = ValidateProfessionRecipeCraft(bot, skillId, spellId, expectedItemId, actualItemId);
+    if (result == "OK")
+        result = CastProfessionRecipe(bot, spellId);
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << skillId
+        << kFieldSeparator << spellId
+        << kFieldSeparator << actualItemId
+        << kFieldSeparator << (result == "OK" ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(result);
+
+    SendAddonPacket(requester, replyType, "PROFESSION_RECIPE_CRAFT", payload.str());
 }
 
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken)
@@ -2910,6 +3078,16 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const commandRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             RunOutfitCommand(player, replyType, botRequest.first, tokenRequest.first, commandRequest.first, commandRequest.second);
+            return true;
+        }
+
+        if (requestType == "CRAFT_RECIPE")
+        {
+            std::pair<std::string, std::string> const botRequest = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
+            std::pair<std::string, std::string> const skillRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
+            std::pair<std::string, std::string> const spellRequest = SplitOnce(skillRequest.second, kFieldSeparator);
+            RunProfessionRecipeCraftCommand(player, replyType, botRequest.first, tokenRequest.first, skillRequest.first, spellRequest.first, spellRequest.second);
             return true;
         }
 

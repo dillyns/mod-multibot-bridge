@@ -351,6 +351,14 @@ The exact payloads are consumed internally by the MultiBot addon.
     <td>Refresh stat panel data.</td>
   </tr>
   <tr>
+    <td><code>GET~PVP_STATS</code></td>
+    <td>Refresh PvP statistics panel data.</td>
+  </tr>
+  <tr>
+    <td><code>GET~TALENT_SPEC_LIST</code></td>
+    <td>Refresh available talent spec templates without automatic chat parsing.</td>
+  </tr>
+  <tr>
     <td><code>GET~INVENTORY</code></td>
     <td>Refresh inventory data with item links and icons.</td>
   </tr>
@@ -359,12 +367,48 @@ The exact payloads are consumed internally by the MultiBot addon.
     <td>Refresh spellbook data.</td>
   </tr>
   <tr>
+    <td><code>GET~BOT_SKILLS</code></td>
+    <td>Refresh character info skills, professions, secondary skills, weapon skills and armor skills.</td>
+  </tr>
+  <tr>
+    <td><code>GET~PROFESSION_RECIPES</code></td>
+    <td>Refresh known profession recipes, materials, craftable counts and recipe output metadata.</td>
+  </tr>
+  <tr>
     <td><code>GET~GLYPHS</code></td>
     <td>Refresh glyph sockets, glyph spell IDs and tooltip data.</td>
   </tr>
   <tr>
     <td><code>GET~OUTFITS</code></td>
     <td>Refresh outfit sets and bridge outfit actions.</td>
+  </tr>
+  <tr>
+    <td><code>GET~QUESTS</code></td>
+    <td>Refresh bot quest lists without localized chat parsing.</td>
+  </tr>
+  <tr>
+    <td><code>GET~GAMEOBJECTS</code></td>
+    <td>Refresh game object search results for the addon results frame.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~CRAFT_RECIPE</code></td>
+    <td>Ask a bot to craft one known profession recipe and return detailed cast failure reasons.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~OUTFIT</code></td>
+    <td>Run outfit create, update, reset, equip and replace actions through the bridge.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~RTI</code></td>
+    <td>Run whitelist-only RTI icon and RTI target commands.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~COMBAT</code></td>
+    <td>Run whitelist-only combat strategy commands.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~POSITION</code></td>
+    <td>Run whitelist-only disperse distance and disable commands.</td>
   </tr>
   <tr>
     <td><code>RUN~LOOT</code></td>
@@ -469,6 +513,23 @@ GET~OUTFITS
 If these do not appear, the addon may not be connected to the bridge.
 
 If they appear but data is missing, verify that the target bot is online, grouped, and available to the player.
+
+</details>
+
+<details>
+<summary><strong>Profession recipe crafting fails from the addon</strong></summary>
+
+Check the server console for responses such as:
+
+```text
+PROFESSION_RECIPE_CRAFT~BotName~token~skillId~spellId~itemId~ERR~REQUIRES_SPELL_FOCUS
+PROFESSION_RECIPE_CRAFT~BotName~token~skillId~spellId~itemId~ERR~MOVING
+PROFESSION_RECIPE_CRAFT~BotName~token~skillId~spellId~itemId~ERR~NO_MATERIALS
+```
+
+The addon displays localized messages for known bridge reasons.
+
+For cooking recipes, `REQUIRES_SPELL_FOCUS` usually means the bot must be near a cooking fire.
 
 </details>
 
