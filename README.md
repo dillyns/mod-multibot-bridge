@@ -399,6 +399,10 @@ The exact payloads are consumed internally by the MultiBot addon.
     <td>Refresh outfit sets and bridge outfit actions.</td>
   </tr>
   <tr>
+    <td><code>GET~TRAINER</code></td>
+    <td>Refresh spells a bot can learn from the player's currently selected trainer, including costs and affordability.</td>
+  </tr>
+  <tr>
     <td><code>GET~QUESTS</code></td>
     <td>Refresh bot quest lists without localized chat parsing.</td>
   </tr>
@@ -417,6 +421,10 @@ The exact payloads are consumed internally by the MultiBot addon.
   <tr>
     <td><code>RUN~OUTFIT</code></td>
     <td>Run outfit create, update, reset, equip and replace actions through the bridge.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~TRAINER_LEARN</code></td>
+    <td>Ask a bot to learn one trainer spell or all available trainer spells after revalidating the selected trainer.</td>
   </tr>
   <tr>
     <td><code>RUN~RTI</code></td>

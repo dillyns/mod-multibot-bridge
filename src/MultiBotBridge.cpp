@@ -3,6 +3,7 @@
 #include "Creature.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
+#include "BudgetValues.h"
 #include "ChatHelper.h"
 #include "GameObject.h"
 #include "Group.h"
@@ -22,6 +23,7 @@
 #include "SharedDefines.h"
 #include "Spell.h"
 #include "SpellMgr.h"
+#include "Trainer.h"
 #include "Unit.h"
 #include "World.h"
 #include "WorldPacket.h"
@@ -56,7 +58,9 @@ PlayerbotAI* GetBotAI(Player* bot);
 std::vector<Player*> GetBridgeVisibleBots(Player* player);
 void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
+void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -2314,6 +2318,285 @@ void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string cons
     SendAddonPacket(requester, replyType, "BOT_EMBLEMS_END", UrlEncodeField(bot->GetName()) + std::string(1, kFieldSeparator) + requestToken);
 }
 
+struct TrainerSpellEntryData
+{
+    uint32 spellId = 0;
+    uint32 cost = 0;
+    bool canAfford = false;
+};
+
+bool BotHasGoldCheat(Player* bot)
+{
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    return botAI && botAI->HasCheat(BotCheatMask::gold);
+}
+
+uint32 GetBotTrainerFreeMoney(Player* bot)
+{
+    if (!bot)
+        return 0;
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI)
+        return bot->GetMoney();
+
+    if (botAI->HasCheat(BotCheatMask::gold))
+        return std::numeric_limits<uint32>::max();
+
+    AiObjectContext* const context = botAI->GetAiObjectContext();
+    if (!context)
+        return bot->GetMoney();
+
+    return AI_VALUE2(uint32, "free money for", static_cast<uint32>(NeedMoneyFor::spells));
+}
+
+Creature* GetSelectedTrainer(Player* requester, uint32 expectedEntry, std::string& reason)
+{
+    reason = "NO_TRAINER_TARGET";
+    if (!requester)
+        return nullptr;
+
+    Unit* const selectedUnit = requester->GetSelectedUnit();
+    Creature* const creature = selectedUnit ? selectedUnit->ToCreature() : nullptr;
+    if (!creature || !creature->IsTrainer())
+        return nullptr;
+
+    if (expectedEntry && creature->GetEntry() != expectedEntry)
+    {
+        reason = "TRAINER_CHANGED";
+        return nullptr;
+    }
+
+    if (!sObjectMgr->GetTrainer(creature->GetEntry()))
+    {
+        reason = "NO_TRAINER";
+        return nullptr;
+    }
+
+    reason = "OK";
+    return creature;
+}
+
+std::vector<TrainerSpellEntryData> BuildTrainerSpellEntries(Player* bot, Creature* trainerCreature)
+{
+    std::vector<TrainerSpellEntryData> entries;
+    if (!bot || !trainerCreature)
+        return entries;
+
+    Trainer::Trainer* const trainer = sObjectMgr->GetTrainer(trainerCreature->GetEntry());
+    if (!trainer || !trainer->IsTrainerValidForPlayer(bot))
+        return entries;
+
+    float const reputationDiscount = bot->GetReputationPriceDiscount(trainerCreature);
+    uint32 const freeMoney = GetBotTrainerFreeMoney(bot);
+    bool const hasGoldCheat = BotHasGoldCheat(bot);
+
+    for (auto const& spell : trainer->GetSpells())
+    {
+        Trainer::Spell const* const trainerSpell = trainer->GetSpell(spell.SpellId);
+        if (!trainerSpell || !trainer->CanTeachSpell(bot, trainerSpell))
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(trainerSpell->SpellId);
+        if (!spellInfo)
+            continue;
+
+        TrainerSpellEntryData entry;
+        entry.spellId = trainerSpell->SpellId;
+        entry.cost = static_cast<uint32>(floor(trainerSpell->MoneyCost * reputationDiscount));
+        entry.canAfford = hasGoldCheat || freeMoney >= entry.cost;
+        entries.push_back(entry);
+    }
+
+    return entries;
+}
+
+std::string BuildTrainerHeaderPayload(std::string const& botName, std::string const& requestToken, uint32 trainerEntry, std::string const& trainerName)
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName)
+        << kFieldSeparator << Trim(requestToken)
+        << kFieldSeparator << trainerEntry
+        << kFieldSeparator << UrlEncodeField(trainerName);
+    return payload.str();
+}
+
+void SendTrainerErrorPacket(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 trainerEntry, std::string const& reason)
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName)
+        << kFieldSeparator << Trim(requestToken)
+        << kFieldSeparator << trainerEntry
+        << kFieldSeparator << UrlEncodeField(reason);
+    SendAddonPacket(requester, replyType, "TRAINER_ERROR", payload.str());
+}
+
+void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    std::string trainerReason;
+    Creature* const trainerCreature = GetSelectedTrainer(requester, 0, trainerReason);
+    uint32 const trainerEntry = trainerCreature ? trainerCreature->GetEntry() : 0;
+    std::string const trainerName = trainerCreature ? trainerCreature->GetName() : "";
+    std::string const headerPayload = BuildTrainerHeaderPayload(effectiveBotName, requestToken, trainerEntry, trainerName);
+
+    SendAddonPacket(requester, replyType, "TRAINER_BEGIN", headerPayload);
+
+    if (!bot)
+    {
+        SendTrainerErrorPacket(requester, replyType, effectiveBotName, requestToken, trainerEntry, "NO_BOT");
+        SendAddonPacket(requester, replyType, "TRAINER_END", headerPayload);
+        return;
+    }
+
+    if (!trainerCreature)
+    {
+        SendTrainerErrorPacket(requester, replyType, effectiveBotName, requestToken, trainerEntry, trainerReason);
+        SendAddonPacket(requester, replyType, "TRAINER_END", headerPayload);
+        return;
+    }
+
+    Trainer::Trainer* const trainer = sObjectMgr->GetTrainer(trainerCreature->GetEntry());
+    if (!trainer || !trainer->IsTrainerValidForPlayer(bot))
+    {
+        SendTrainerErrorPacket(requester, replyType, effectiveBotName, requestToken, trainerEntry, "INVALID_TRAINER");
+        SendAddonPacket(requester, replyType, "TRAINER_END", headerPayload);
+        return;
+    }
+
+    for (TrainerSpellEntryData const& entry : BuildTrainerSpellEntries(bot, trainerCreature))
+    {
+        std::ostringstream payload;
+        payload << UrlEncodeField(bot->GetName())
+            << kFieldSeparator << Trim(requestToken)
+            << kFieldSeparator << trainerEntry
+            << kFieldSeparator << entry.spellId
+            << kFieldSeparator << entry.cost
+            << kFieldSeparator << (entry.canAfford ? "1" : "0");
+        SendAddonPacket(requester, replyType, "TRAINER_ITEM", payload.str());
+    }
+
+    SendAddonPacket(requester, replyType, "TRAINER_END", headerPayload);
+}
+
+bool LearnTrainerSpell(Player* bot, SpellInfo const* spellInfo, uint32 cost, std::string& reason)
+{
+    if (!bot || !spellInfo)
+    {
+        reason = "NO_SPELL";
+        return false;
+    }
+
+    if (!BotHasGoldCheat(bot))
+    {
+        if (GetBotTrainerFreeMoney(bot) < cost)
+        {
+            reason = "TOO_EXPENSIVE";
+            return false;
+        }
+
+        bot->ModifyMoney(-static_cast<int32>(cost));
+    }
+
+    if (spellInfo->HasEffect(SPELL_EFFECT_LEARN_SPELL))
+        bot->CastSpell(bot, spellInfo->Id, true);
+    else
+        bot->learnSpell(spellInfo->Id, false);
+
+    reason = "OK";
+    return true;
+}
+
+void SendTrainerLearnResult(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, uint32 trainerEntry, std::string const& spellIdValue, bool ok, std::string const& reason, uint32 learnedCount, uint32 spent)
+{
+    std::ostringstream payload;
+    payload << UrlEncodeField(botName)
+        << kFieldSeparator << Trim(requestToken)
+        << kFieldSeparator << trainerEntry
+        << kFieldSeparator << UrlEncodeField(Trim(spellIdValue))
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << learnedCount
+        << kFieldSeparator << spent;
+    SendAddonPacket(requester, replyType, "TRAINER_LEARN", payload.str());
+}
+
+void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    uint32 const expectedTrainerEntry = static_cast<uint32>(std::strtoul(Trim(trainerEntryValue).c_str(), nullptr, 10));
+    std::string const requestedSpell = ToUpper(Trim(spellIdValue));
+    bool const learnAll = requestedSpell == "ALL";
+    uint32 const requestedSpellId = learnAll ? 0 : static_cast<uint32>(std::strtoul(requestedSpell.c_str(), nullptr, 10));
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+
+    if (!bot)
+    {
+        SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, false, "NO_BOT", 0, 0);
+        return;
+    }
+
+    if (!expectedTrainerEntry)
+    {
+        SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, false, "NO_TRAINER", 0, 0);
+        return;
+    }
+
+    if (!learnAll && !requestedSpellId)
+    {
+        SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, false, "NO_SPELL", 0, 0);
+        return;
+    }
+
+    std::string trainerReason;
+    Creature* const trainerCreature = GetSelectedTrainer(requester, expectedTrainerEntry, trainerReason);
+    if (!trainerCreature)
+    {
+        SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, false, trainerReason, 0, 0);
+        return;
+    }
+
+    Trainer::Trainer* const trainer = sObjectMgr->GetTrainer(trainerCreature->GetEntry());
+    if (!trainer || !trainer->IsTrainerValidForPlayer(bot))
+    {
+        SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, false, "INVALID_TRAINER", 0, 0);
+        return;
+    }
+
+    std::vector<TrainerSpellEntryData> const entries = BuildTrainerSpellEntries(bot, trainerCreature);
+    uint32 learnedCount = 0;
+    uint32 spent = 0;
+    std::string reason = "NO_MATCHING_SPELL";
+
+    for (TrainerSpellEntryData const& entry : entries)
+    {
+        if (!learnAll && entry.spellId != requestedSpellId)
+            continue;
+
+        SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(entry.spellId);
+        std::string learnReason;
+        if (LearnTrainerSpell(bot, spellInfo, entry.cost, learnReason))
+        {
+            ++learnedCount;
+            spent += entry.cost;
+            reason = "OK";
+        }
+        else if (learnReason != "OK" && learnedCount == 0)
+            reason = learnReason;
+
+        if (!learnAll)
+            break;
+    }
+
+    SendTrainerLearnResult(requester, replyType, effectiveBotName, token, expectedTrainerEntry, spellIdValue, learnedCount > 0, reason, learnedCount, spent);
+}
+
 void SendProfessionRecipePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& skillIdValue, std::string const& requestToken)
 {
     std::string const trimmedBotName = Trim(botName);
@@ -4012,6 +4295,13 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "TRAINER")
+        {
+            std::pair<std::string, std::string> const trainerRequest = SplitOnce(request.second, kFieldSeparator);
+            SendTrainerPackets(player, replyType, trainerRequest.first, Trim(trainerRequest.second));
+            return true;
+        }
+
         return false;
     }
 
@@ -4026,6 +4316,15 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
             std::pair<std::string, std::string> const commandRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
             RunOutfitCommand(player, replyType, botRequest.first, tokenRequest.first, commandRequest.first, commandRequest.second);
+            return true;
+        }
+
+        if (requestType == "TRAINER_LEARN")
+        {
+            std::pair<std::string, std::string> const botRequest = SplitOnce(request.second, kFieldSeparator);
+            std::pair<std::string, std::string> const tokenRequest = SplitOnce(botRequest.second, kFieldSeparator);
+            std::pair<std::string, std::string> const trainerRequest = SplitOnce(tokenRequest.second, kFieldSeparator);
+            RunTrainerLearnCommand(player, replyType, botRequest.first, tokenRequest.first, trainerRequest.first, trainerRequest.second);
             return true;
         }
 
