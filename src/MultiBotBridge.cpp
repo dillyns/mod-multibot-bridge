@@ -23,6 +23,13 @@
 #include "SharedDefines.h"
 #include "Spell.h"
 #include "SpellMgr.h"
+#include "StringFormat.h"
+#include "Util.h"
+#include "MultiBotBridgeBank.h"
+#include "MultiBotBridgeInternal.h"
+#include "MultiBotBridgeInventory.h"
+#include "MultiBotBridgeReputation.h"
+#include "MultiBotBridgeRoster.h"
 #include "Trainer.h"
 #include "Unit.h"
 #include "World.h"
@@ -43,39 +50,24 @@
 
 namespace
 {
+using namespace MultiBotBridgeInternal;
+
 char const* const kAddonPrefix = "MBOT";
 char const* const kBridgeName = "mod-multibot-bridge";
 char const* const kProtocolVersion = "1";
-char const kFieldSeparator = '~';
 
 bool BridgeConsoleLogsEnabled()
 {
     return sConfigMgr->GetOption<bool>("MultiBotBridge.EnableConsoleLogs", true);
 }
 
-Player* FindBotByName(Player* player, std::string const& botName);
 PlayerbotAI* GetBotAI(Player* bot);
-std::vector<Player*> GetBridgeVisibleBots(Player* player);
-void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload = "");
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
-void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
-void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
-uint32 GetPct(uint32 current, uint32 max);
-
-std::string Trim(std::string const& value)
-{
-    size_t start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos)
-        return "";
-
-    size_t end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
 
 std::string ToUpper(std::string value)
 {
@@ -97,7 +89,7 @@ bool TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& p
     if (lang != LANG_ADDON)
         return false;
 
-    payload = Trim(msg);
+    payload = Acore::String::Trim(msg);
     if (payload.empty())
         return false;
 
@@ -110,56 +102,6 @@ bool TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& p
 
     return !payload.empty();
 }
-
-std::string UrlEncodeField(std::string const& value)
-{
-    std::ostringstream out;
-    char const* const hex = "0123456789ABCDEF";
-
-    for (unsigned char c : value)
-    {
-        if (c == '%' || c == '~' || c == '\r' || c == '\n')
-        {
-            out << '%';
-            out << hex[(c >> 4) & 0x0F];
-            out << hex[c & 0x0F];
-        }
-        else
-            out << static_cast<char>(c);
-    }
-
-    return out.str();
-}
-
-std::string UrlDecodeField(std::string const& value)
-{
-    std::string out;
-    out.reserve(value.size());
-
-    for (std::size_t i = 0; i < value.size(); ++i)
-    {
-        if (value[i] == '%' && i + 2 < value.size() && std::isxdigit(static_cast<unsigned char>(value[i + 1])) && std::isxdigit(static_cast<unsigned char>(value[i + 2])))
-        {
-            std::string const hex = value.substr(i + 1, 2);
-            out.push_back(static_cast<char>(std::strtoul(hex.c_str(), nullptr, 16)));
-            i += 2;
-            continue;
-        }
-
-        out.push_back(value[i]);
-    }
-
-    return out;
-}
-
-struct InventorySummaryData
-{
-    uint32 gold = 0;
-    uint32 silver = 0;
-    uint32 copper = 0;
-    uint32 bagUsed = 0;
-    uint32 bagTotal = 16;
-};
 
 struct StatsData
 {
@@ -190,15 +132,6 @@ struct BotSkillEntryData
     std::string name;
     uint32 value = 0;
     uint32 maxValue = 0;
-};
-
-struct BotReputationEntryData
-{
-    uint32 factionId = 0;
-    std::string name;
-    uint32 rank = 0;
-    int32 value = 0;
-    int32 maxValue = 0;
 };
 
 struct SkillDefinition
@@ -334,7 +267,6 @@ struct PvpStatsData
 
     std::array<TeamData, 3> teams;
 };
-
 
 struct QuestEntryData
 {
@@ -625,88 +557,6 @@ std::string BuildBotSkillEntryPayload(Player* bot, std::string const& token, Bot
     return out.str();
 }
 
-int32 GetReputationRankBase(ReputationRank rank)
-{
-    int32 base = ReputationMgr::Reputation_Cap + 1;
-    for (int32 i = MAX_REPUTATION_RANK - 1; i >= static_cast<int32>(rank); --i)
-        base -= ReputationMgr::PointsInRank[i];
-
-    return base;
-}
-
-BotReputationEntryData BuildBotReputationEntry(Player* bot, FactionEntry const* entry)
-{
-    BotReputationEntryData data;
-    if (!bot || !entry)
-        return data;
-
-    ReputationMgr& reputationMgr = bot->GetReputationMgr();
-    ReputationRank const rank = reputationMgr.GetRank(entry);
-    int32 const reputation = reputationMgr.GetReputation(entry->ID);
-    int32 const maxValue = ReputationMgr::PointsInRank[rank];
-    int32 value = reputation - GetReputationRankBase(rank);
-
-    if (value < 0)
-        value = 0;
-    if (value > maxValue)
-        value = maxValue;
-
-    data.factionId = entry->ID;
-    data.name = entry->name[0];
-    data.rank = static_cast<uint32>(rank);
-    data.value = value;
-    data.maxValue = maxValue;
-    return data;
-}
-
-std::vector<BotReputationEntryData> BuildBotReputationEntries(Player* bot)
-{
-    std::vector<BotReputationEntryData> entries;
-    if (!bot)
-        return entries;
-
-    ReputationMgr& reputationMgr = bot->GetReputationMgr();
-    FactionStateList const& stateList = reputationMgr.GetStateList();
-    entries.reserve(stateList.size());
-
-    for (auto const& itr : stateList)
-    {
-        FactionState const& faction = itr.second;
-        if (!(faction.Flags & FACTION_FLAG_VISIBLE))
-            continue;
-
-        if (faction.Flags & (FACTION_FLAG_HIDDEN | FACTION_FLAG_INVISIBLE_FORCED) &&
-            !(faction.Flags & FACTION_FLAG_SPECIAL))
-            continue;
-
-        FactionEntry const* const entry = sFactionStore.LookupEntry(faction.ID);
-        if (!entry)
-            continue;
-
-        entries.push_back(BuildBotReputationEntry(bot, entry));
-    }
-
-    std::sort(entries.begin(), entries.end(), [](BotReputationEntryData const& left, BotReputationEntryData const& right)
-    {
-        return left.name < right.name;
-    });
-
-    return entries;
-}
-
-std::string BuildBotReputationEntryPayload(Player* bot, std::string const& token, BotReputationEntryData const& entry)
-{
-    std::ostringstream out;
-    out << UrlEncodeField(bot->GetName())
-        << kFieldSeparator << token
-        << kFieldSeparator << entry.factionId
-        << kFieldSeparator << UrlEncodeField(entry.name)
-        << kFieldSeparator << entry.rank
-        << kFieldSeparator << entry.value
-        << kFieldSeparator << entry.maxValue;
-    return out.str();
-}
-
 std::string BuildBotProfessionPayload(Player* bot)
 {
     if (!bot)
@@ -844,7 +694,7 @@ std::string BuildTalentLinkPointSummary(std::string const& link)
 
 std::string GetPremadeSpecConfigString(std::string const& key)
 {
-    return Trim(sConfigMgr->GetOption<std::string>(key, ""));
+    return Acore::String::Trim(sConfigMgr->GetOption<std::string>(key, ""));
 }
 
 std::string GetPremadeSpecLink(uint8 classId, uint32 specIndex, uint32 botLevel)
@@ -909,8 +759,8 @@ std::vector<TalentSpecEntryData> BuildTalentSpecEntries(Player* bot)
 
 void SendTalentSpecListPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
 {
-    std::string const requestedBotName = Trim(botNameValue);
-    std::string const token = Trim(tokenValue);
+    std::string const requestedBotName = Acore::String::Trim(botNameValue);
+    std::string const token = Acore::String::Trim(tokenValue);
     Player* const bot = FindBotByName(requester, requestedBotName);
 
     std::string const effectiveBotName = bot ? bot->GetName() : requestedBotName;
@@ -1005,8 +855,8 @@ uint32 FindGlyphItemId(uint32 glyphId, uint32 spellId)
 
 void SendGlyphPackets(Player* requester, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
 {
-    std::string const requestedBotName = Trim(botNameValue);
-    std::string const token = Trim(tokenValue);
+    std::string const requestedBotName = Acore::String::Trim(botNameValue);
+    std::string const token = Acore::String::Trim(tokenValue);
     Player* const bot = FindBotByName(requester, requestedBotName);
 
     std::string const effectiveBotName = bot ? bot->GetName() : requestedBotName;
@@ -1044,7 +894,7 @@ void SendGlyphPackets(Player* requester, ChatMsg replyType, std::string const& b
 
 std::string NormalizeQuestMode(std::string const& mode)
 {
-    std::string normalized = ToUpper(Trim(mode));
+    std::string normalized = ToUpper(Acore::String::Trim(mode));
     if (normalized != "INCOMPLETED" && normalized != "COMPLETED" && normalized != "ALL")
         normalized = "ALL";
 
@@ -1175,8 +1025,8 @@ void SendQuestPacketsForBot(Player* requester, ChatMsg replyType, Player* bot, s
 void SendQuestPackets(Player* player, ChatMsg replyType, std::string const& modeValue, std::string const& botNameValue, std::string const& tokenValue)
 {
     std::string const mode = NormalizeQuestMode(modeValue);
-    std::string const botName = Trim(botNameValue);
-    std::string const token = Trim(tokenValue);
+    std::string const botName = Acore::String::Trim(botNameValue);
+    std::string const token = Acore::String::Trim(tokenValue);
 
     if (!botName.empty())
     {
@@ -1249,8 +1099,8 @@ void SendGameObjectPacketsForBot(Player* requester, ChatMsg replyType, Player* b
 
 void SendGameObjectPackets(Player* player, ChatMsg replyType, std::string const& botNameValue, std::string const& tokenValue)
 {
-    std::string const botName = Trim(botNameValue);
-    std::string const token = Trim(tokenValue);
+    std::string const botName = Acore::String::Trim(botNameValue);
+    std::string const token = Acore::String::Trim(tokenValue);
 
     if (!botName.empty())
     {
@@ -1663,44 +1513,6 @@ std::vector<ProfessionRecipeEntryData> BuildProfessionRecipeEntries(Player* bot,
     return entries;
 }
 
-InventorySummaryData BuildInventorySummary(Player* bot)
-{
-    InventorySummaryData summary;
-    if (!bot)
-        return summary;
-
-    uint32 const money = bot->GetMoney();
-    summary.gold = money / 10000;
-    summary.silver = (money % 10000) / 100;
-    summary.copper = money % 100;
-
-    uint32 used = 0;
-    uint32 total = 16;
-
-    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
-    {
-        if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
-            ++used;
-    }
-
-    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
-    {
-        if (Bag const* const pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag))
-        {
-            ItemTemplate const* const proto = pBag->GetTemplate();
-            if (proto && proto->Class == ITEM_CLASS_CONTAINER && proto->SubClass == ITEM_SUBCLASS_CONTAINER)
-            {
-                total += pBag->GetBagSize();
-                used += pBag->GetBagSize() - pBag->GetFreeSlots();
-            }
-        }
-    }
-
-    summary.bagUsed = used;
-    summary.bagTotal = total;
-    return summary;
-}
-
 uint32 BuildDurabilityPct(Player* bot)
 {
     if (!bot)
@@ -1787,73 +1599,6 @@ std::string BuildStatsPayload(Player* bot)
     return out.str();
 }
 
-void SendInventorySnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
-{
-    std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
-
-    std::string const prefixPayload = trimmedBotName + std::string(1, kFieldSeparator) + requestToken;
-    SendAddonPacket(requester, replyType, "INV_BEGIN", prefixPayload);
-
-    if (!bot)
-    {
-        SendAddonPacket(requester, replyType, "INV_END", prefixPayload);
-        return;
-    }
-
-    InventorySummaryData const summary = BuildInventorySummary(bot);
-    std::ostringstream summaryPayload;
-    summaryPayload << bot->GetName() << kFieldSeparator << requestToken << kFieldSeparator << summary.gold << kFieldSeparator
-                   << summary.silver << kFieldSeparator << summary.copper << kFieldSeparator << summary.bagUsed
-                   << kFieldSeparator << summary.bagTotal;
-    SendAddonPacket(requester, replyType, "INV_SUMMARY", summaryPayload.str());
-
-    PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
-    if (botAI)
-    {
-        std::map<uint32, uint32> itemCounts;
-        std::map<uint32, ItemTemplate const*> itemTemplates;
-        std::map<uint32, bool> soulboundByEntry;
-
-        std::vector<Item*> const items = botAI->GetInventoryItems();
-        for (Item* const item : items)
-        {
-            if (!item)
-                continue;
-
-            ItemTemplate const* const proto = item->GetTemplate();
-            if (!proto)
-                continue;
-
-            uint32 const itemId = proto->ItemId;
-            itemCounts[itemId] += item->GetCount();
-            itemTemplates[itemId] = proto;
-            if (item->IsSoulBound())
-                soulboundByEntry[itemId] = true;
-        }
-
-        for (auto const& entry : itemCounts)
-        {
-            ItemTemplate const* const proto = itemTemplates[entry.first];
-            if (!proto)
-                continue;
-
-            std::string line = ChatHelper::FormatItem(proto, entry.second);
-            if (soulboundByEntry[entry.first])
-                line += " (soulbound)";
-
-            std::string payload = bot->GetName();
-            payload += kFieldSeparator;
-            payload += requestToken;
-            payload += kFieldSeparator;
-            payload += UrlEncodeField(line);
-            SendAddonPacket(requester, replyType, "INV_ITEM", payload);
-        }
-    }
-
-    SendAddonPacket(requester, replyType, "INV_END", bot->GetName() + std::string(1, kFieldSeparator) + requestToken);
-}
-
 PlayerbotAI* GetBotAI(Player* bot)
 {
     if (!bot)
@@ -1862,354 +1607,9 @@ PlayerbotAI* GetBotAI(Player* bot)
     return sPlayerbotsMgr.GetPlayerbotAI(bot);
 }
 
-Creature* FindNearbyNpcWithFlag(Player* bot, uint32 npcFlag)
-{
-    PlayerbotAI* const botAI = GetBotAI(bot);
-    if (!botAI || !botAI->GetAiObjectContext())
-        return nullptr;
-
-    AiObjectContext* const context = botAI->GetAiObjectContext();
-    GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
-    for (ObjectGuid const guid : npcs)
-    {
-        Unit* const unit = botAI->GetUnit(guid);
-        if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(npcFlag)))
-            continue;
-
-        if (Creature* const creature = unit->ToCreature())
-            return creature;
-    }
-
-    return nullptr;
-}
-
-Creature* FindNearbyVendorSellingItem(Player* bot, uint32 itemId, uint32& vendorSlot, uint32& vendorExtendedCost, bool& sawVendor)
-{
-    vendorSlot = 0;
-    vendorExtendedCost = 0;
-    sawVendor = false;
-
-    PlayerbotAI* const botAI = GetBotAI(bot);
-    if (!botAI || !botAI->GetAiObjectContext() || !itemId)
-        return nullptr;
-
-    AiObjectContext* const context = botAI->GetAiObjectContext();
-    GuidVector const npcs = *context->GetValue<GuidVector>("nearest npcs");
-    for (ObjectGuid const guid : npcs)
-    {
-        Unit* const unit = botAI->GetUnit(guid);
-        if (!unit || unit->IsHostileTo(bot) || !unit->HasNpcFlag(static_cast<NPCFlags>(UNIT_NPC_FLAG_VENDOR)))
-            continue;
-
-        Creature* const creature = unit->ToCreature();
-        if (!creature)
-            continue;
-
-        sawVendor = true;
-        VendorItemData const* const vendorItems = creature->GetVendorItems();
-        if (!vendorItems)
-            continue;
-
-        for (uint32 slot = 0; slot < vendorItems->GetItemCount(); ++slot)
-        {
-            VendorItem const* const vendorItem = vendorItems->GetItem(slot);
-            if (vendorItem && vendorItem->item == itemId)
-            {
-                vendorSlot = slot;
-                vendorExtendedCost = vendorItem->ExtendedCost;
-                return creature;
-            }
-        }
-    }
-
-    return nullptr;
-}
-
-GameObject* FindNearbyGuildBank(Player* bot)
-{
-    PlayerbotAI* const botAI = GetBotAI(bot);
-    if (!botAI || !botAI->GetAiObjectContext())
-        return nullptr;
-
-    AiObjectContext* const context = botAI->GetAiObjectContext();
-    GuidVector const objects = *context->GetValue<GuidVector>("nearest game objects");
-    for (ObjectGuid const guid : objects)
-        if (GameObject* const go = botAI->GetGameObject(guid))
-            if (bot->GetGameObjectIfCanInteractWith(go->GetGUID(), GAMEOBJECT_TYPE_GUILD_BANK))
-                return go;
-
-    return nullptr;
-}
-
-Item* FindBagItemByEntry(Player* bot, uint32 itemEntry)
-{
-    if (!bot || !itemEntry)
-        return nullptr;
-
-    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
-        if (Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
-            if (item->GetEntry() == itemEntry)
-                return item;
-
-    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
-    {
-        Bag const* const pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
-        if (!pBag)
-            continue;
-
-        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
-            if (Item* const item = bot->GetItemByPos(bag, slot))
-                if (item->GetEntry() == itemEntry)
-                    return item;
-    }
-
-    return nullptr;
-}
-
-Item* FindBankItemByEntry(Player* bot, uint32 itemEntry)
-{
-    if (!bot || !itemEntry)
-        return nullptr;
-
-    for (uint8 slot = BANK_SLOT_ITEM_START; slot < BANK_SLOT_ITEM_END; ++slot)
-        if (Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
-            if (item->GetEntry() == itemEntry)
-                return item;
-
-    for (uint8 bag = BANK_SLOT_BAG_START; bag < BANK_SLOT_BAG_END; ++bag)
-    {
-        Bag const* const pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
-        if (!pBag)
-            continue;
-
-        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
-            if (Item* const item = bot->GetItemByPos(bag, slot))
-                if (item->GetEntry() == itemEntry)
-                    return item;
-    }
-
-    return nullptr;
-}
-
-void AddBankItemToSnapshot(std::map<uint32, uint32>& itemCounts, std::map<uint32, ItemTemplate const*>& itemTemplates, std::map<uint32, bool>& soulboundByEntry, Item* item)
-{
-    if (!item)
-        return;
-
-    ItemTemplate const* const proto = item->GetTemplate();
-    if (!proto)
-        return;
-
-    uint32 const itemId = proto->ItemId;
-    itemCounts[itemId] += item->GetCount();
-    itemTemplates[itemId] = proto;
-    if (item->IsSoulBound())
-        soulboundByEntry[itemId] = true;
-}
-
-void AddItemEntryToSnapshot(std::map<uint32, uint32>& itemCounts, std::map<uint32, ItemTemplate const*>& itemTemplates, uint32 itemId, uint32 count)
-{
-    if (!itemId || !count)
-        return;
-
-    ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(itemId);
-    if (!proto)
-        return;
-
-    itemCounts[itemId] += count;
-    itemTemplates[itemId] = proto;
-}
-
-int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* bot, uint8 tabId)
-{
-    if (!guild || !bot)
-        return 0;
-
-    Guild::Member const* const member = guild->GetMember(bot->GetGUID());
-    if (!member)
-        return 0;
-
-    if (member->IsRank(GR_GUILDMASTER) || guild->GetLeaderGUID() == bot->GetGUID())
-        return std::numeric_limits<int32>::max();
-
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT gbright, SlotPerDay FROM guild_bank_right "
-        "WHERE guildid = {} AND TabId = {} AND rid = {}",
-        guild->GetId(), uint32(tabId), uint32(member->GetRankId()));
-
-    if (!result)
-        return 0;
-
-    Field* const fields = result->Fetch();
-    uint32 const rights = fields[0].Get<uint32>();
-    uint32 const slotsPerDay = fields[1].Get<uint32>();
-
-    if ((rights & GUILD_BANK_RIGHT_VIEW_TAB) == 0 || slotsPerDay == 0)
-        return 0;
-
-    if (slotsPerDay == uint32(GUILD_WITHDRAW_SLOT_UNLIMITED))
-        return std::numeric_limits<int32>::max();
-
-    int32 const used = member->GetBankWithdrawValue(tabId);
-    int64 const remaining = int64(slotsPerDay) - int64(used > 0 ? used : 0);
-    return remaining > 0 ? int32(std::min<int64>(remaining, std::numeric_limits<int32>::max())) : 0;
-}
-
-int32 GetGuildBankWithdrawRemaining(Guild* guild, Player* bot)
-{
-    int32 bestRemaining = 0;
-    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
-    {
-        int32 const remaining = GetGuildBankTabWithdrawRemaining(guild, bot, tabId);
-        if (remaining == std::numeric_limits<int32>::max())
-            return remaining;
-
-        if (remaining > bestRemaining)
-            bestRemaining = remaining;
-    }
-
-    return bestRemaining;
-}
-
-void SendBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
-{
-    std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
-    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
-    std::string const prefixPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + requestToken;
-
-    SendAddonPacket(requester, replyType, "BANK_BEGIN", prefixPayload);
-
-    if (!bot)
-    {
-        SendAddonPacket(requester, replyType, "BANK_ERROR", prefixPayload + std::string(1, kFieldSeparator) + "NO_BOT");
-        SendAddonPacket(requester, replyType, "BANK_END", prefixPayload);
-        return;
-    }
-
-    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
-    {
-        SendAddonPacket(requester, replyType, "BANK_ERROR", prefixPayload + std::string(1, kFieldSeparator) + "BANKER_NOT_FOUND");
-        SendAddonPacket(requester, replyType, "BANK_END", prefixPayload);
-        return;
-    }
-
-    std::map<uint32, uint32> itemCounts;
-    std::map<uint32, ItemTemplate const*> itemTemplates;
-    std::map<uint32, bool> soulboundByEntry;
-
-    for (uint8 slot = BANK_SLOT_ITEM_START; slot < BANK_SLOT_ITEM_END; ++slot)
-        AddBankItemToSnapshot(itemCounts, itemTemplates, soulboundByEntry, bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
-
-    for (uint8 bag = BANK_SLOT_BAG_START; bag < BANK_SLOT_BAG_END; ++bag)
-    {
-        Bag const* const pBag = (Bag*)bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bag);
-        if (!pBag)
-            continue;
-
-        for (uint8 slot = 0; slot < pBag->GetBagSize(); ++slot)
-            AddBankItemToSnapshot(itemCounts, itemTemplates, soulboundByEntry, bot->GetItemByPos(bag, slot));
-    }
-
-    for (auto const& entry : itemCounts)
-    {
-        ItemTemplate const* const proto = itemTemplates[entry.first];
-        if (!proto)
-            continue;
-
-        std::string line = ChatHelper::FormatItem(proto, entry.second);
-        if (soulboundByEntry[entry.first])
-            line += " (soulbound)";
-
-        SendAddonPacket(requester, replyType, "BANK_ITEM", prefixPayload + std::string(1, kFieldSeparator) + UrlEncodeField(line));
-    }
-
-    SendAddonPacket(requester, replyType, "BANK_END", prefixPayload);
-}
-
-void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
-{
-    std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
-    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
-    std::string const prefixPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + requestToken;
-
-    SendAddonPacket(requester, replyType, "GBANK_BEGIN", prefixPayload);
-
-    auto sendErrorAndEnd = [&](std::string const& reason)
-    {
-        SendAddonPacket(requester, replyType, "GBANK_ERROR", prefixPayload + std::string(1, kFieldSeparator) + reason);
-        SendAddonPacket(requester, replyType, "GBANK_END", prefixPayload);
-    };
-
-    if (!bot)
-    {
-        sendErrorAndEnd("NO_BOT");
-        return;
-    }
-
-    if (!bot->GetGuildId())
-    {
-        sendErrorAndEnd("BOT_NOT_IN_GUILD");
-        return;
-    }
-
-    Guild* const guild = sGuildMgr->GetGuildById(bot->GetGuildId());
-    if (!guild)
-    {
-        sendErrorAndEnd("BOT_NOT_IN_GUILD");
-        return;
-    }
-
-    int32 const withdrawRemaining = GetGuildBankWithdrawRemaining(guild, bot);
-    SendAddonPacket(
-        requester,
-        replyType,
-        "GBANK_RIGHTS",
-        prefixPayload + std::string(1, kFieldSeparator)
-            + (withdrawRemaining != 0 ? "1" : "0")
-            + std::string(1, kFieldSeparator)
-            + std::to_string(withdrawRemaining));
-
-    std::map<uint32, uint32> itemCounts;
-    std::map<uint32, ItemTemplate const*> itemTemplates;
-
-    for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
-    {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT ii.itemEntry, ii.count "
-            "FROM guild_bank_item gbi "
-            "INNER JOIN item_instance ii ON ii.guid = gbi.item_guid "
-            "WHERE gbi.guildid = {} AND gbi.TabId = {} "
-            "ORDER BY gbi.SlotId",
-            guild->GetId(), uint32(tabId));
-
-        if (!result)
-            continue;
-
-        do
-        {
-            Field* const fields = result->Fetch();
-            AddItemEntryToSnapshot(itemCounts, itemTemplates, fields[0].Get<uint32>(), fields[1].Get<uint32>());
-        }
-        while (result->NextRow());
-    }
-
-    for (auto const& entry : itemCounts)
-    {
-        ItemTemplate const* const proto = itemTemplates[entry.first];
-        if (!proto)
-            continue;
-
-        SendAddonPacket(requester, replyType, "GBANK_ITEM", prefixPayload + std::string(1, kFieldSeparator) + UrlEncodeField(ChatHelper::FormatItem(proto, entry.second)));
-    }
-
-    SendAddonPacket(requester, replyType, "GBANK_END", prefixPayload);
-}
-
 void SendSpellbookSnapshot(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = Acore::String::Trim(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = trimmedBotName + std::string(1, kFieldSeparator) + requestToken;
@@ -2234,7 +1634,7 @@ void SendSpellbookSnapshot(Player* requester, ChatMsg replyType, std::string con
 
 void SendBotSkillPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = Acore::String::Trim(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
@@ -2252,26 +1652,6 @@ void SendBotSkillPackets(Player* requester, ChatMsg replyType, std::string const
     SendAddonPacket(requester, replyType, "BOT_SKILLS_END", UrlEncodeField(bot->GetName()) + std::string(1, kFieldSeparator) + requestToken);
 }
 
-void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
-{
-    std::string const trimmedBotName = Trim(botName);
-    Player* const bot = FindBotByName(requester, trimmedBotName);
-
-    std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
-    SendAddonPacket(requester, replyType, "BOT_REPUTATIONS_BEGIN", prefixPayload);
-
-    if (!bot)
-    {
-        SendAddonPacket(requester, replyType, "BOT_REPUTATIONS_END", prefixPayload);
-        return;
-    }
-
-    for (BotReputationEntryData const& entry : BuildBotReputationEntries(bot))
-        SendAddonPacket(requester, replyType, "BOT_REPUTATION_ITEM", BuildBotReputationEntryPayload(bot, requestToken, entry));
-
-    SendAddonPacket(requester, replyType, "BOT_REPUTATIONS_END", UrlEncodeField(bot->GetName()) + std::string(1, kFieldSeparator) + requestToken);
-}
-
 void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
     static std::array<uint32, 6> const emblemIds = {{
@@ -2283,7 +1663,7 @@ void SendBotEmblemPackets(Player* requester, ChatMsg replyType, std::string cons
         49426  // Emblem of Frost
     }};
 
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = Acore::String::Trim(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::string const prefixPayload = UrlEncodeField(trimmedBotName) + std::string(1, kFieldSeparator) + requestToken;
@@ -2415,7 +1795,7 @@ std::string BuildTrainerHeaderPayload(std::string const& botName, std::string co
 {
     std::ostringstream payload;
     payload << UrlEncodeField(botName)
-        << kFieldSeparator << Trim(requestToken)
+        << kFieldSeparator << Acore::String::Trim(requestToken)
         << kFieldSeparator << trainerEntry
         << kFieldSeparator << UrlEncodeField(trainerName);
     return payload.str();
@@ -2425,7 +1805,7 @@ void SendTrainerErrorPacket(Player* requester, ChatMsg replyType, std::string co
 {
     std::ostringstream payload;
     payload << UrlEncodeField(botName)
-        << kFieldSeparator << Trim(requestToken)
+        << kFieldSeparator << Acore::String::Trim(requestToken)
         << kFieldSeparator << trainerEntry
         << kFieldSeparator << UrlEncodeField(reason);
     SendAddonPacket(requester, replyType, "TRAINER_ERROR", payload.str());
@@ -2433,7 +1813,7 @@ void SendTrainerErrorPacket(Player* requester, ChatMsg replyType, std::string co
 
 void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = Acore::String::Trim(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
 
@@ -2471,7 +1851,7 @@ void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const&
     {
         std::ostringstream payload;
         payload << UrlEncodeField(bot->GetName())
-            << kFieldSeparator << Trim(requestToken)
+            << kFieldSeparator << Acore::String::Trim(requestToken)
             << kFieldSeparator << trainerEntry
             << kFieldSeparator << entry.spellId
             << kFieldSeparator << entry.cost
@@ -2514,9 +1894,9 @@ void SendTrainerLearnResult(Player* requester, ChatMsg replyType, std::string co
 {
     std::ostringstream payload;
     payload << UrlEncodeField(botName)
-        << kFieldSeparator << Trim(requestToken)
+        << kFieldSeparator << Acore::String::Trim(requestToken)
         << kFieldSeparator << trainerEntry
-        << kFieldSeparator << UrlEncodeField(Trim(spellIdValue))
+        << kFieldSeparator << UrlEncodeField(Acore::String::Trim(spellIdValue))
         << kFieldSeparator << (ok ? "OK" : "ERR")
         << kFieldSeparator << UrlEncodeField(reason)
         << kFieldSeparator << learnedCount
@@ -2526,10 +1906,10 @@ void SendTrainerLearnResult(Player* requester, ChatMsg replyType, std::string co
 
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue)
 {
-    std::string const trimmedBotName = Trim(botName);
-    std::string const token = Trim(requestToken);
-    uint32 const expectedTrainerEntry = static_cast<uint32>(std::strtoul(Trim(trainerEntryValue).c_str(), nullptr, 10));
-    std::string const requestedSpell = ToUpper(Trim(spellIdValue));
+    std::string const trimmedBotName = Acore::String::Trim(botName);
+    std::string const token = Acore::String::Trim(requestToken);
+    uint32 const expectedTrainerEntry = static_cast<uint32>(std::strtoul(Acore::String::Trim(trainerEntryValue).c_str(), nullptr, 10));
+    std::string const requestedSpell = ToUpper(Acore::String::Trim(spellIdValue));
     bool const learnAll = requestedSpell == "ALL";
     uint32 const requestedSpellId = learnAll ? 0 : static_cast<uint32>(std::strtoul(requestedSpell.c_str(), nullptr, 10));
 
@@ -2599,8 +1979,8 @@ void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string co
 
 void SendProfessionRecipePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& skillIdValue, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
-    uint32 const skillId = static_cast<uint32>(std::strtoul(Trim(skillIdValue).c_str(), nullptr, 10));
+    std::string const trimmedBotName = Acore::String::Trim(botName);
+    uint32 const skillId = static_cast<uint32>(std::strtoul(Acore::String::Trim(skillIdValue).c_str(), nullptr, 10));
     Player* const bot = FindBotByName(requester, trimmedBotName);
 
     std::ostringstream beginPayload;
@@ -2672,7 +2052,7 @@ std::vector<uint32> ParseOutfitItemEntries(std::string const& value)
 
     while (std::getline(in, item, ','))
     {
-        item = Trim(item);
+        item = Acore::String::Trim(item);
         if (item.empty())
             continue;
 
@@ -2702,7 +2082,7 @@ std::vector<OutfitSetSnapshot> BuildOutfitSnapshots(Player* bot)
 
     for (std::string const& savedOutfit : savedOutfits)
     {
-        std::string const trimmed = Trim(savedOutfit);
+        std::string const trimmed = Acore::String::Trim(savedOutfit);
         if (trimmed.empty())
             continue;
 
@@ -2711,7 +2091,7 @@ std::vector<OutfitSetSnapshot> BuildOutfitSnapshots(Player* bot)
             continue;
 
         OutfitSetSnapshot outfit;
-        outfit.name = Trim(trimmed.substr(0, separator));
+        outfit.name = Acore::String::Trim(trimmed.substr(0, separator));
         if (outfit.name.empty())
             outfit.name = "Outfit";
 
@@ -2727,10 +2107,10 @@ std::vector<OutfitSetSnapshot> BuildOutfitSnapshots(Player* bot)
 
 void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
 {
-    std::string const trimmedBotName = Trim(botName);
+    std::string const trimmedBotName = Acore::String::Trim(botName);
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
-    std::string const headerPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + Trim(requestToken);
+    std::string const headerPayload = UrlEncodeField(effectiveBotName) + std::string(1, kFieldSeparator) + Acore::String::Trim(requestToken);
 
     SendAddonPacket(requester, replyType, "OUTFITS_BEGIN", headerPayload);
 
@@ -2741,7 +2121,7 @@ void SendOutfitPackets(Player* requester, ChatMsg replyType, std::string const& 
         {
             std::ostringstream payload;
             payload << UrlEncodeField(bot->GetName())
-                << kFieldSeparator << Trim(requestToken)
+                << kFieldSeparator << Acore::String::Trim(requestToken)
                 << kFieldSeparator << UrlEncodeField(BuildOutfitRawLine(outfit));
 
             SendAddonPacket(requester, replyType, "OUTFITS_ITEM", payload.str());
@@ -2761,13 +2141,13 @@ OutfitCommandParts ParseOutfitCommandSuffix(std::string const& suffix)
 {
     OutfitCommandParts parts;
 
-    std::string const cleaned = Trim(suffix);
+    std::string const cleaned = Acore::String::Trim(suffix);
     std::size_t const lastSpace = cleaned.find_last_of(' ');
     if (lastSpace == std::string::npos || lastSpace == 0 || lastSpace + 1 >= cleaned.size())
         return parts;
 
-    parts.name = Trim(cleaned.substr(0, lastSpace));
-    parts.action = ToUpper(Trim(cleaned.substr(lastSpace + 1)));
+    parts.name = Acore::String::Trim(cleaned.substr(0, lastSpace));
+    parts.action = ToUpper(Acore::String::Trim(cleaned.substr(lastSpace + 1)));
     return parts;
 }
 
@@ -2796,7 +2176,7 @@ std::string SanitizeOutfitCommandSuffix(std::string suffix)
 {
     suffix.erase(std::remove(suffix.begin(), suffix.end(), '\r'), suffix.end());
     suffix.erase(std::remove(suffix.begin(), suffix.end(), '\n'), suffix.end());
-    return Trim(suffix);
+    return Acore::String::Trim(suffix);
 }
 
 std::vector<uint32> CollectCurrentEquippedOutfitEntries(Player* bot)
@@ -2825,7 +2205,7 @@ bool SaveOutfitEntries(PlayerbotAI* botAI, std::string const& outfitName, std::v
     if (!context)
         return false;
 
-    std::string const name = Trim(outfitName);
+    std::string const name = Acore::String::Trim(outfitName);
     if (name.empty())
         return false;
 
@@ -2833,9 +2213,9 @@ bool SaveOutfitEntries(PlayerbotAI* botAI, std::string const& outfitName, std::v
 
     for (std::vector<std::string>::iterator it = savedOutfits.begin(); it != savedOutfits.end(); ++it)
     {
-        std::string const existing = Trim(*it);
+        std::string const existing = Acore::String::Trim(*it);
         std::size_t const separator = existing.find('=');
-        std::string const existingName = Trim(separator == std::string::npos ? existing : existing.substr(0, separator));
+        std::string const existingName = Acore::String::Trim(separator == std::string::npos ? existing : existing.substr(0, separator));
         if (existingName == name)
         {
             savedOutfits.erase(it);
@@ -2881,19 +2261,19 @@ bool ApplyBridgeNativeOutfitCommand(Player* bot, std::string const& suffix)
             if (!context)
                 return false;
 
-            std::string const outfitName = Trim(parts.name);
+            std::string const outfitName = Acore::String::Trim(parts.name);
             if (outfitName.empty())
                 return false;
 
             std::vector<std::string>& savedOutfits = AI_VALUE(std::vector<std::string>&, "outfit list");
             for (std::string const& savedOutfit : savedOutfits)
             {
-                std::string const existing = Trim(savedOutfit);
+                std::string const existing = Acore::String::Trim(savedOutfit);
                 std::size_t const separator = existing.find('=');
                 if (separator == std::string::npos)
                     continue;
 
-                std::string const existingName = Trim(existing.substr(0, separator));
+                std::string const existingName = Acore::String::Trim(existing.substr(0, separator));
                 if (existingName != outfitName)
                     continue;
 
@@ -3060,352 +2440,13 @@ bool ExecuteSilentBotCommand(Player* requester, Player* bot, std::string const& 
     return true;
 }
 
-uint32 MoveMatchingBagItemsToBank(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
-{
-    if (!bot || !itemId)
-    {
-        reason = "BAD_REQUEST";
-        return 0;
-    }
-
-    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
-    {
-        reason = "BANKER_NOT_FOUND";
-        return 0;
-    }
-
-    uint32 moved = 0;
-    while (Item* const item = FindBagItemByEntry(bot, itemId))
-    {
-        uint32 const stackCount = item->GetCount();
-        ItemPosCountVec dest;
-        InventoryResult const msg = bot->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false);
-        if (msg != EQUIP_ERR_OK)
-        {
-            reason = "BANK_FULL";
-            return moved;
-        }
-
-        bot->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
-        bot->BankItem(dest, item, true);
-        moved += stackCount;
-
-        if (requestedCount > 0 && moved >= requestedCount)
-            break;
-    }
-
-    if (!moved)
-        reason = "ITEM_NOT_FOUND";
-
-    return moved;
-}
-
-uint32 MoveMatchingBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
-{
-    if (!bot || !itemId)
-    {
-        reason = "BAD_REQUEST";
-        return 0;
-    }
-
-    if (!FindNearbyNpcWithFlag(bot, UNIT_NPC_FLAG_BANKER))
-    {
-        reason = "BANKER_NOT_FOUND";
-        return 0;
-    }
-
-    uint32 moved = 0;
-    while (Item* const item = FindBankItemByEntry(bot, itemId))
-    {
-        uint32 const stackCount = item->GetCount();
-        ItemPosCountVec dest;
-        InventoryResult const msg = bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
-        if (msg != EQUIP_ERR_OK)
-        {
-            reason = "BAGS_FULL";
-            return moved;
-        }
-
-        bot->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
-        bot->StoreItem(dest, item, true);
-        moved += stackCount;
-
-        if (requestedCount > 0 && moved >= requestedCount)
-            break;
-    }
-
-    if (!moved)
-        reason = "ITEM_NOT_FOUND";
-
-    return moved;
-}
-
-uint32 MoveMatchingBagItemsToGuildBank(Player* requester, Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
-{
-    if (!bot || !itemId)
-    {
-        reason = "BAD_REQUEST";
-        return 0;
-    }
-
-    if (!bot->GetGuildId())
-    {
-        reason = "BOT_NOT_IN_GUILD";
-        return 0;
-    }
-
-    Guild* const guild = sGuildMgr->GetGuildById(bot->GetGuildId());
-    if (!guild)
-    {
-        reason = "BOT_NOT_IN_GUILD";
-        return 0;
-    }
-
-    if (!FindNearbyGuildBank(bot))
-    {
-        reason = "GUILD_BANK_NOT_FOUND";
-        return 0;
-    }
-
-    if (!guild->MemberHasTabRights(bot->GetGUID(), 0, GUILD_BANK_RIGHT_DEPOSIT_ITEM))
-    {
-        reason = "NO_GUILD_BANK_RIGHTS";
-        return 0;
-    }
-
-    uint32 moved = 0;
-    while (Item* const item = FindBagItemByEntry(bot, itemId))
-    {
-        uint32 const stackCount = item->GetCount();
-        uint32 const playerSlot = item->GetSlot();
-        uint32 const playerBag = item->GetBagSlot();
-        ObjectGuid const itemGuid = item->GetGUID();
-        guild->SwapItemsWithInventory(bot, false, 0, 255, playerBag, playerSlot, 0);
-
-        if (Item* const remaining = bot->GetItemByPos(playerBag, playerSlot))
-            if (remaining->GetGUID() == itemGuid)
-            {
-                reason = "GUILD_BANK_FULL";
-                return moved;
-            }
-
-        moved += stackCount;
-
-        if (requestedCount > 0 && moved >= requestedCount)
-            break;
-    }
-
-    if (!moved)
-        reason = "ITEM_NOT_FOUND";
-
-    return moved;
-}
-
-uint32 MoveMatchingGuildBankItemsToBags(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
-{
-    if (!bot || !itemId)
-    {
-        reason = "BAD_REQUEST";
-        return 0;
-    }
-
-    if (!bot->GetGuildId())
-    {
-        reason = "BOT_NOT_IN_GUILD";
-        return 0;
-    }
-
-    Guild* const guild = sGuildMgr->GetGuildById(bot->GetGuildId());
-    if (!guild)
-    {
-        reason = "BOT_NOT_IN_GUILD";
-        return 0;
-    }
-
-    if (!FindNearbyGuildBank(bot))
-    {
-        reason = "GUILD_BANK_NOT_FOUND";
-        return 0;
-    }
-
-    if (GetGuildBankWithdrawRemaining(guild, bot) == 0)
-    {
-        reason = "NO_GUILD_BANK_RIGHTS";
-        return 0;
-    }
-
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT gbi.TabId, gbi.SlotId, ii.count "
-        "FROM guild_bank_item gbi "
-        "INNER JOIN item_instance ii ON ii.guid = gbi.item_guid "
-        "WHERE gbi.guildid = {} AND ii.itemEntry = {} "
-        "ORDER BY gbi.TabId, gbi.SlotId",
-        guild->GetId(), itemId);
-
-    if (!result)
-    {
-        reason = "ITEM_NOT_FOUND";
-        return 0;
-    }
-
-    bool foundAny = false;
-    bool foundWithdrawable = false;
-    uint32 moved = 0;
-
-    do
-    {
-        Field* const fields = result->Fetch();
-        uint8 const tabId = fields[0].Get<uint8>();
-        uint8 const slotId = fields[1].Get<uint8>();
-        uint32 const stackCount = fields[2].Get<uint32>();
-        foundAny = true;
-
-        if (GetGuildBankTabWithdrawRemaining(guild, bot, tabId) == 0)
-            continue;
-
-        foundWithdrawable = true;
-
-        uint32 splitCount = 0;
-        if (requestedCount > 0)
-        {
-            uint32 const remainingRequest = requestedCount > moved ? requestedCount - moved : 0;
-            if (!remainingRequest)
-                break;
-
-            splitCount = std::min(stackCount, remainingRequest);
-            if (splitCount >= stackCount)
-                splitCount = 0;
-        }
-
-        uint32 const before = bot->GetItemCount(itemId, false);
-        guild->SwapItemsWithInventory(bot, true, tabId, slotId, NULL_BAG, NULL_SLOT, splitCount);
-        uint32 const after = bot->GetItemCount(itemId, false);
-
-        if (after > before)
-            moved += after - before;
-
-        if (requestedCount > 0 && moved >= requestedCount)
-            break;
-    }
-    while (result->NextRow());
-
-    if (!moved)
-    {
-        if (!foundAny)
-            reason = "ITEM_NOT_FOUND";
-        else if (!foundWithdrawable)
-            reason = "NO_GUILD_BANK_RIGHTS";
-        else
-            reason = "BAGS_FULL";
-    }
-
-    return moved;
-}
-
-uint32 BuyMatchingVendorItem(Player* bot, uint32 itemId, uint32 requestedCount, std::string& reason)
-{
-    if (!bot || !itemId)
-    {
-        reason = "BAD_REQUEST";
-        return 0;
-    }
-
-    ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(itemId);
-    if (!proto)
-    {
-        reason = "ITEM_NOT_FOUND";
-        return 0;
-    }
-
-    uint32 vendorSlot = 0;
-    uint32 vendorExtendedCost = 0;
-    bool sawVendor = false;
-    Creature* const vendor = FindNearbyVendorSellingItem(bot, itemId, vendorSlot, vendorExtendedCost, sawVendor);
-    if (!vendor)
-    {
-        reason = sawVendor ? "VENDOR_DOES_NOT_SELL_ITEM" : "VENDOR_NOT_FOUND";
-        return 0;
-    }
-
-    uint32 const desired = requestedCount > 0 ? requestedCount : 1;
-    uint32 bought = 0;
-    for (uint32 i = 0; i < desired; ++i)
-    {
-        uint32 const price = uint32(std::floor(proto->BuyPrice * bot->GetReputationPriceDiscount(vendor)));
-        if (price > 0 && bot->GetMoney() < price)
-        {
-            reason = "NOT_ENOUGH_MONEY";
-            break;
-        }
-
-        uint32 const oldCount = bot->GetItemCount(itemId, false);
-        bot->BuyItemFromVendorSlot(vendor->GetGUID(), vendorSlot, itemId, 1, NULL_BAG, NULL_SLOT);
-        uint32 const newCount = bot->GetItemCount(itemId, false);
-        if (newCount <= oldCount)
-        {
-            reason = vendorExtendedCost > 0 ? "VENDOR_REQUIRES_SPECIAL_CURRENCY" : "BUY_FAILED";
-            break;
-        }
-
-        bought += newCount - oldCount;
-    }
-
-    return bought;
-}
-
-void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue)
-{
-    std::string const trimmedBotName = Trim(botName);
-    std::string const token = Trim(requestToken);
-    std::string const action = ToUpper(Trim(actionValue));
-    uint32 const itemId = static_cast<uint32>(std::strtoul(Trim(itemIdValue).c_str(), nullptr, 10));
-    uint32 const requestedCount = static_cast<uint32>(std::strtoul(Trim(countValue).c_str(), nullptr, 10));
-
-    Player* const bot = FindBotByName(requester, trimmedBotName);
-    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
-
-    std::string reason;
-    uint32 moved = 0;
-    if (!bot)
-        reason = "NO_BOT";
-    else if (action == "BANK_DEPOSIT")
-        moved = MoveMatchingBagItemsToBank(bot, itemId, requestedCount, reason);
-    else if (action == "BANK_WITHDRAW")
-        moved = MoveMatchingBankItemsToBags(bot, itemId, requestedCount, reason);
-    else if (action == "GBANK_DEPOSIT")
-        moved = MoveMatchingBagItemsToGuildBank(requester, bot, itemId, requestedCount, reason);
-    else if (action == "GBANK_WITHDRAW")
-        moved = MoveMatchingGuildBankItemsToBags(bot, itemId, requestedCount, reason);
-    else if (action == "BUY_ITEM")
-        moved = BuyMatchingVendorItem(bot, itemId, requestedCount, reason);
-    else
-        reason = "BAD_ACTION";
-
-    bool const ok = moved > 0;
-    if (ok)
-        reason = "OK";
-    else if (reason.empty())
-        reason = "FAILED";
-
-    std::ostringstream payload;
-    payload << UrlEncodeField(effectiveBotName)
-        << kFieldSeparator << token
-        << kFieldSeparator << action
-        << kFieldSeparator << itemId
-        << kFieldSeparator << (ok ? "OK" : "ERR")
-        << kFieldSeparator << UrlEncodeField(reason)
-        << kFieldSeparator << moved;
-
-    SendAddonPacket(requester, replyType, "INVENTORY_ITEM_ACTION", payload.str());
-}
-
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue)
 {
-    std::string const trimmedBotName = Trim(botName);
-    std::string const token = Trim(requestToken);
-    uint32 const skillId = static_cast<uint32>(std::strtoul(Trim(skillIdValue).c_str(), nullptr, 10));
-    uint32 const spellId = static_cast<uint32>(std::strtoul(Trim(spellIdValue).c_str(), nullptr, 10));
-    uint32 const expectedItemId = static_cast<uint32>(std::strtoul(Trim(itemIdValue).c_str(), nullptr, 10));
+    std::string const trimmedBotName = Acore::String::Trim(botName);
+    std::string const token = Acore::String::Trim(requestToken);
+    uint32 const skillId = static_cast<uint32>(std::strtoul(Acore::String::Trim(skillIdValue).c_str(), nullptr, 10));
+    uint32 const spellId = static_cast<uint32>(std::strtoul(Acore::String::Trim(spellIdValue).c_str(), nullptr, 10));
+    uint32 const expectedItemId = static_cast<uint32>(std::strtoul(Acore::String::Trim(itemIdValue).c_str(), nullptr, 10));
 
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
@@ -3429,8 +2470,8 @@ void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::
 
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken)
 {
-    std::string const trimmedBotName = Trim(botName);
-    std::string const token = Trim(requestToken);
+    std::string const trimmedBotName = Acore::String::Trim(botName);
+    std::string const token = Acore::String::Trim(requestToken);
     std::string const suffix = SanitizeOutfitCommandSuffix(UrlDecodeField(encodedSuffix));
     Player* const bot = FindBotByName(requester, trimmedBotName);
     std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
@@ -3443,7 +2484,7 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
         else
             ok = ExecuteSilentBotCommand(requester, bot, "outfit " + suffix);
 
-        if (ok && IsUpdateOutfitCommandSuffix(suffix) && Trim(persistToken) == "1")
+        if (ok && IsUpdateOutfitCommandSuffix(suffix) && Acore::String::Trim(persistToken) == "1")
             ExecuteSilentBotCommand(requester, bot, "nc +chat");
     }
 
@@ -3458,12 +2499,12 @@ void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& b
 bool IsAllowedRTIIcon(std::string const& value)
 {
     static std::set<std::string> const allowed = { "STAR", "CIRCLE", "DIAMOND", "TRIANGLE", "MOON", "SQUARE", "CROSS", "SKULL" };
-    return allowed.find(ToUpper(Trim(value))) != allowed.end();
+    return allowed.find(ToUpper(Acore::String::Trim(value))) != allowed.end();
 }
 
 bool IsAllowedRTICommand(std::string const& command)
 {
-    std::istringstream in(ToUpper(Trim(command)));
+    std::istringstream in(ToUpper(Acore::String::Trim(command)));
     std::vector<std::string> parts;
     std::string part;
 
@@ -3501,7 +2542,7 @@ bool ApplyNativeDisperseCommand(Player* bot, std::string const& command)
     if (command != "disperse disable")
     {
         std::string const prefix = "disperse set ";
-        std::string const valueText = Trim(command.substr(prefix.size()));
+        std::string const valueText = Acore::String::Trim(command.substr(prefix.size()));
 
         char* end = nullptr;
         double const value = std::strtod(valueText.c_str(), &end);
@@ -3523,7 +2564,7 @@ bool ApplyNativeDisperseCommand(Player* bot, std::string const& command)
 
 bool IsAllowedCombatCommand(std::string const& command)
 {
-    std::string const normalized = ToUpper(Trim(command));
+    std::string const normalized = ToUpper(Acore::String::Trim(command));
 
     static std::set<std::string> const allowed =
     {
@@ -3556,7 +2597,7 @@ bool IsAllowedCombatCommand(std::string const& command)
     if (normalized.rfind(waitPrefix, 0) != 0)
         return false;
 
-    std::string const value = Trim(normalized.substr(waitPrefix.size()));
+    std::string const value = Acore::String::Trim(normalized.substr(waitPrefix.size()));
     if (value.empty())
         return false;
 
@@ -3576,7 +2617,7 @@ bool IsAllowedCombatCommand(std::string const& command)
 
 std::string NormalizeCombatCommand(std::string const& command)
 {
-    std::string const trimmed = Trim(command);
+    std::string const trimmed = Acore::String::Trim(command);
     std::string const normalized = ToUpper(trimmed);
 
     // Backward compatibility with the first addon patch.
@@ -3592,7 +2633,7 @@ std::string NormalizeCombatCommand(std::string const& command)
 
 std::string NormalizePositionCommand(std::string const& command)
 {
-    std::string normalized = Trim(command);
+    std::string normalized = Acore::String::Trim(command);
     std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c)
     {
         return static_cast<char>(std::tolower(c));
@@ -3605,7 +2646,7 @@ std::string NormalizePositionCommand(std::string const& command)
     if (normalized.rfind(prefix, 0) != 0)
         return "";
 
-    std::string const valueText = Trim(normalized.substr(prefix.size()));
+    std::string const valueText = Acore::String::Trim(normalized.substr(prefix.size()));
     if (valueText.empty())
         return "";
 
@@ -3621,7 +2662,7 @@ std::string NormalizePositionCommand(std::string const& command)
 
 std::string NormalizeLootCommand(std::string const& command)
 {
-    std::string normalized = Trim(command);
+    std::string normalized = Acore::String::Trim(command);
     std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c)
     {
         return static_cast<char>(std::tolower(c));
@@ -3643,7 +2684,7 @@ bool IsAllowedLootCommand(std::string const& command)
         "ll skill"
     };
 
-    return allowed.find(Trim(command)) != allowed.end();
+    return allowed.find(Acore::String::Trim(command)) != allowed.end();
 }
 
 bool BotMatchesRTIScope(Player* requester, Player* bot, std::string const& scope, std::string const& target)
@@ -3698,10 +2739,10 @@ bool BotMatchesCombatScope(Player* requester, Player* bot, std::string const& sc
 
 void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
-    std::string const scope = ToUpper(Trim(scopeValue));
-    std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
-    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const scope = ToUpper(Acore::String::Trim(scopeValue));
+    std::string const target = Acore::String::Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Acore::String::Trim(requestToken);
+    std::string const rawCommand = Acore::String::Trim(UrlDecodeField(encodedCommand));
     std::string const command = NormalizeCombatCommand(rawCommand);
     uint32 executed = 0;
 
@@ -3729,10 +2770,10 @@ void RunRTICommand(Player* requester, ChatMsg replyType, std::string const& scop
 
 void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
-    std::string const scope = ToUpper(Trim(scopeValue));
-    std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
-    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const scope = ToUpper(Acore::String::Trim(scopeValue));
+    std::string const target = Acore::String::Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Acore::String::Trim(requestToken);
+    std::string const rawCommand = Acore::String::Trim(UrlDecodeField(encodedCommand));
     std::string const command = NormalizeCombatCommand(rawCommand);
     uint32 executed = 0;
 
@@ -3760,10 +2801,10 @@ void RunCombatCommand(Player* requester, ChatMsg replyType, std::string const& s
 
 void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
-    std::string const scope = ToUpper(Trim(scopeValue));
-    std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
-    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const scope = ToUpper(Acore::String::Trim(scopeValue));
+    std::string const target = Acore::String::Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Acore::String::Trim(requestToken);
+    std::string const rawCommand = Acore::String::Trim(UrlDecodeField(encodedCommand));
     std::string const command = NormalizePositionCommand(rawCommand);
     uint32 executed = 0;
 
@@ -3791,10 +2832,10 @@ void RunPositionCommand(Player* requester, ChatMsg replyType, std::string const&
 
 void RunLootCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedCommand)
 {
-    std::string const scope = ToUpper(Trim(scopeValue));
-    std::string const target = Trim(UrlDecodeField(encodedTarget));
-    std::string const token = Trim(requestToken);
-    std::string const rawCommand = Trim(UrlDecodeField(encodedCommand));
+    std::string const scope = ToUpper(Acore::String::Trim(scopeValue));
+    std::string const target = Acore::String::Trim(UrlDecodeField(encodedTarget));
+    std::string const token = Acore::String::Trim(requestToken);
+    std::string const rawCommand = Acore::String::Trim(UrlDecodeField(encodedCommand));
     std::string const command = NormalizeLootCommand(rawCommand);
     uint32 executed = 0;
 
@@ -3834,31 +2875,6 @@ ChatMsg NormalizeReplyChatType(uint32 type)
         default:
             return CHAT_MSG_WHISPER;
     }
-}
-
-void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload)
-{
-    if (!player || !player->GetSession())
-        return;
-
-    std::string wire = std::string(kAddonPrefix) + "\t" + opcode;
-    if (!payload.empty())
-        wire += std::string(1, kFieldSeparator) + payload;
-
-    if (BridgeConsoleLogsEnabled())
-        LOG_INFO("playerbots", "MultiBotBridge TX [{}] type={}", wire, static_cast<uint32>(chatType));
-
-    WorldPacket data;
-    ChatHandler::BuildChatPacket(data, chatType, LANG_ADDON, player, nullptr, wire.c_str());
-    player->SendDirectMessage(&data);
-}
-
-uint32 GetPct(uint32 current, uint32 max)
-{
-    if (!max)
-        return 0;
-
-    return static_cast<uint32>((current * 100u) / max);
 }
 
 bool IsBotInRequesterGroup(Player* requester, Player* bot)
@@ -3904,43 +2920,6 @@ void AppendBridgeVisibleBot(Player* bot, std::vector<Player*>& bots, std::set<Ob
     bots.push_back(bot);
 }
 
-std::vector<Player*> GetBridgeVisibleBots(Player* player)
-{
-    std::vector<Player*> bots;
-    std::set<ObjectGuid> seen;
-
-    if (!player)
-        return bots;
-
-    if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
-        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
-            AppendBridgeVisibleBot(it->second, bots, seen);
-
-    for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
-    {
-        Player* const bot = it->second;
-        if (CanExposeRandomHolderBot(player, bot))
-            AppendBridgeVisibleBot(bot, bots, seen);
-    }
-
-    return bots;
-}
-
-Player* FindBotByName(Player* player, std::string const& botName)
-{
-    std::string const wantedName = Trim(botName);
-    if (wantedName.empty())
-        return nullptr;
-
-    for (Player* const bot : GetBridgeVisibleBots(player))
-    {
-        if (bot->GetName() == wantedName)
-            return bot;
-    }
-
-    return nullptr;
-}
-
 std::string JoinStrategies(std::vector<std::string> const& strategies)
 {
     std::ostringstream out;
@@ -3951,25 +2930,6 @@ std::string JoinStrategies(std::vector<std::string> const& strategies)
             out << ", ";
 
         out << strategies[index];
-    }
-
-    return out.str();
-}
-
-std::string BuildRosterPayload(Player* player)
-{
-    std::ostringstream out;
-    bool first = true;
-
-    for (Player* const bot : GetBridgeVisibleBots(player))
-    {
-        if (!first)
-            out << ';';
-        first = false;
-
-        out << bot->GetName() << ',' << static_cast<uint32>(bot->getClass()) << ',' << static_cast<uint32>(bot->GetLevel())
-            << ',' << static_cast<uint32>(bot->GetMapId()) << ',' << (bot->IsAlive() ? '1' : '0') << ','
-            << GetPct(bot->GetHealth(), bot->GetMaxHealth()) << ',' << GetPct(bot->GetPower(POWER_MANA), bot->GetMaxPower(POWER_MANA));
     }
 
     return out.str();
@@ -4056,7 +3016,7 @@ std::string BuildStatePayload(Player* player, std::string const& botName)
 {
     Player* const bot = FindBotByName(player, botName);
     if (!bot)
-        return Trim(botName) + std::string(1, kFieldSeparator) + kFieldSeparator;
+        return Acore::String::Trim(botName) + std::string(1, kFieldSeparator) + kFieldSeparator;
 
     PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
     if (!botAI)
@@ -4114,7 +3074,7 @@ void SendStatsPackets(Player* player, ChatMsg replyType)
 
 bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& opcode, std::string const& payload)
 {
-    std::string const normalized = ToUpper(Trim(opcode));
+    std::string const normalized = ToUpper(Acore::String::Trim(opcode));
 
     if (normalized == "HELLO")
     {
@@ -4131,11 +3091,29 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
     if (normalized == "GET")
     {
         std::pair<std::string, std::string> const request = SplitOnce(payload, kFieldSeparator);
-        std::string const requestType = ToUpper(Trim(request.first));
+        std::string const requestType = ToUpper(Acore::String::Trim(request.first));
 
         if (requestType == "ROSTER")
         {
-            SendAddonPacket(player, replyType, "ROSTER", BuildRosterPayload(player));
+            SendRosterPacket(player, replyType);
+            return true;
+        }
+
+        if (requestType == "ACCOUNT_ROSTER")
+        {
+            SendAccountRosterPacket(player, replyType);
+            return true;
+        }
+
+        if (requestType == "GUILD_ROSTER")
+        {
+            SendGuildRosterPacket(player, replyType);
+            return true;
+        }
+
+        if (requestType == "FRIEND_ROSTER")
+        {
+            SendFriendRosterPacket(player, replyType);
             return true;
         }
 
@@ -4211,7 +3189,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         if (requestType == "PVP_STATS")
         {
-            std::string const botName = Trim(request.second);
+            std::string const botName = Acore::String::Trim(request.second);
             if (botName.empty())
                 SendPvpStatsPackets(player, replyType);
             else
@@ -4222,7 +3200,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
         if (requestType == "STATS")
         {
-            std::string const botName = Trim(request.second);
+            std::string const botName = Acore::String::Trim(request.second);
             if (botName.empty())
                 SendStatsPackets(player, replyType);
             else
@@ -4234,49 +3212,49 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         if (requestType == "INVENTORY")
         {
             std::pair<std::string, std::string> const inventoryRequest = SplitOnce(request.second, kFieldSeparator);
-            SendInventorySnapshot(player, replyType, inventoryRequest.first, Trim(inventoryRequest.second));
+            SendInventorySnapshot(player, replyType, inventoryRequest.first, Acore::String::Trim(inventoryRequest.second));
             return true;
         }
 
         if (requestType == "BANK")
         {
             std::pair<std::string, std::string> const bankRequest = SplitOnce(request.second, kFieldSeparator);
-            SendBankPackets(player, replyType, bankRequest.first, Trim(bankRequest.second));
+            SendBankPackets(player, replyType, bankRequest.first, Acore::String::Trim(bankRequest.second));
             return true;
         }
 
         if (requestType == "GBANK")
         {
             std::pair<std::string, std::string> const bankRequest = SplitOnce(request.second, kFieldSeparator);
-            SendGuildBankPackets(player, replyType, bankRequest.first, Trim(bankRequest.second));
+            SendGuildBankPackets(player, replyType, bankRequest.first, Acore::String::Trim(bankRequest.second));
             return true;
         }
 
         if (requestType == "SPELLBOOK")
         {
             std::pair<std::string, std::string> const spellbookRequest = SplitOnce(request.second, kFieldSeparator);
-            SendSpellbookSnapshot(player, replyType, spellbookRequest.first, Trim(spellbookRequest.second));
+            SendSpellbookSnapshot(player, replyType, spellbookRequest.first, Acore::String::Trim(spellbookRequest.second));
             return true;
         }
 
         if (requestType == "BOT_SKILLS")
         {
             std::pair<std::string, std::string> const skillRequest = SplitOnce(request.second, kFieldSeparator);
-            SendBotSkillPackets(player, replyType, skillRequest.first, Trim(skillRequest.second));
+            SendBotSkillPackets(player, replyType, skillRequest.first, Acore::String::Trim(skillRequest.second));
             return true;
         }
 
         if (requestType == "BOT_REPUTATIONS")
         {
             std::pair<std::string, std::string> const reputationRequest = SplitOnce(request.second, kFieldSeparator);
-            SendBotReputationPackets(player, replyType, reputationRequest.first, Trim(reputationRequest.second));
+            SendBotReputationPackets(player, replyType, reputationRequest.first, Acore::String::Trim(reputationRequest.second));
             return true;
         }
 
         if (requestType == "BOT_EMBLEMS")
         {
             std::pair<std::string, std::string> const emblemRequest = SplitOnce(request.second, kFieldSeparator);
-            SendBotEmblemPackets(player, replyType, emblemRequest.first, Trim(emblemRequest.second));
+            SendBotEmblemPackets(player, replyType, emblemRequest.first, Acore::String::Trim(emblemRequest.second));
             return true;
         }
 
@@ -4284,21 +3262,21 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         {
             std::pair<std::string, std::string> const recipeBotRequest = SplitOnce(request.second, kFieldSeparator);
             std::pair<std::string, std::string> const recipeSkillRequest = SplitOnce(recipeBotRequest.second, kFieldSeparator);
-            SendProfessionRecipePackets(player, replyType, recipeBotRequest.first, recipeSkillRequest.first, Trim(recipeSkillRequest.second));
+            SendProfessionRecipePackets(player, replyType, recipeBotRequest.first, recipeSkillRequest.first, Acore::String::Trim(recipeSkillRequest.second));
             return true;
         }
 
         if (requestType == "OUTFITS")
         {
             std::pair<std::string, std::string> const outfitRequest = SplitOnce(request.second, kFieldSeparator);
-            SendOutfitPackets(player, replyType, outfitRequest.first, Trim(outfitRequest.second));
+            SendOutfitPackets(player, replyType, outfitRequest.first, Acore::String::Trim(outfitRequest.second));
             return true;
         }
 
         if (requestType == "TRAINER")
         {
             std::pair<std::string, std::string> const trainerRequest = SplitOnce(request.second, kFieldSeparator);
-            SendTrainerPackets(player, replyType, trainerRequest.first, Trim(trainerRequest.second));
+            SendTrainerPackets(player, replyType, trainerRequest.first, Acore::String::Trim(trainerRequest.second));
             return true;
         }
 
@@ -4308,7 +3286,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
     if (normalized == "RUN")
     {
         std::pair<std::string, std::string> const request = SplitOnce(payload, kFieldSeparator);
-        std::string const requestType = ToUpper(Trim(request.first));
+        std::string const requestType = ToUpper(Acore::String::Trim(request.first));
 
         if (requestType == "OUTFIT")
         {
@@ -4436,6 +3414,106 @@ public:
     }
 };
 } // namespace
+
+namespace MultiBotBridgeInternal
+{
+std::string UrlEncodeField(std::string const& value)
+{
+    std::ostringstream out;
+    char const* const hex = "0123456789ABCDEF";
+
+    for (unsigned char c : value)
+    {
+        if (c == '%' || c == '~' || c == '\r' || c == '\n')
+        {
+            out << '%';
+            out << hex[(c >> 4) & 0x0F];
+            out << hex[c & 0x0F];
+        }
+        else
+            out << static_cast<char>(c);
+    }
+
+    return out.str();
+}
+
+std::string UrlDecodeField(std::string const& value)
+{
+    std::string out;
+    out.reserve(value.size());
+
+    for (std::size_t i = 0; i < value.size(); ++i)
+    {
+        if (value[i] == '%' && i + 2 < value.size() && std::isxdigit(static_cast<unsigned char>(value[i + 1])) && std::isxdigit(static_cast<unsigned char>(value[i + 2])))
+        {
+            std::string const hex = value.substr(i + 1, 2);
+            out.push_back(static_cast<char>(std::strtoul(hex.c_str(), nullptr, 16)));
+            i += 2;
+            continue;
+        }
+
+        out.push_back(value[i]);
+    }
+
+    return out;
+}
+
+void SendAddonPacket(Player* player, ChatMsg chatType, std::string const& opcode, std::string const& payload)
+{
+    if (!player || !player->GetSession())
+        return;
+
+    std::string wire = std::string(kAddonPrefix) + "\t" + opcode;
+    if (!payload.empty())
+        wire += std::string(1, kFieldSeparator) + payload;
+
+    if (BridgeConsoleLogsEnabled())
+        LOG_INFO("playerbots", "MultiBotBridge TX [{}] type={}", wire, static_cast<uint32>(chatType));
+
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, chatType, LANG_ADDON, player, nullptr, wire.c_str());
+    player->SendDirectMessage(&data);
+}
+
+// Returns all bots visible to the player via the bridge: owned bots plus
+// random/addclass bots the player masters or shares a group with.
+std::vector<Player*> GetBridgeVisibleBots(Player* player)
+{
+    std::vector<Player*> bots;
+    std::set<ObjectGuid> seen;
+
+    if (!player)
+        return bots;
+
+    if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+            AppendBridgeVisibleBot(it->second, bots, seen);
+
+    for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+    {
+        Player* const bot = it->second;
+        if (CanExposeRandomHolderBot(player, bot))
+            AppendBridgeVisibleBot(bot, bots, seen);
+    }
+
+    return bots;
+}
+
+Player* FindBotByName(Player* player, std::string const& botName)
+{
+    std::string const wantedName = Acore::String::Trim(botName);
+    if (wantedName.empty())
+        return nullptr;
+
+    for (Player* const bot : GetBridgeVisibleBots(player))
+    {
+        if (bot->GetName() == wantedName)
+            return bot;
+    }
+
+    return nullptr;
+}
+} // namespace MultiBotBridgeInternal
 
 void AddSC_multibot_bridge()
 {
