@@ -93,12 +93,12 @@ bool TryExtractBridgePayload(uint32 lang, std::string const& msg, std::string& p
     if (payload.empty())
         return false;
 
-    if (payload.rfind(kAddonPrefix, 0) == 0)
-    {
-        payload.erase(0, std::char_traits<char>::length(kAddonPrefix));
-        while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
-            payload.erase(payload.begin());
-    }
+    if (payload.rfind(kAddonPrefix, 0) != 0)
+        return false;
+
+    payload.erase(0, std::char_traits<char>::length(kAddonPrefix));
+    while (!payload.empty() && (payload.front() == '	' || payload.front() == ' '))
+        payload.erase(payload.begin());
 
     return !payload.empty();
 }

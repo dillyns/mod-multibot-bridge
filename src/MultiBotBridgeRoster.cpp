@@ -1,7 +1,7 @@
 #include "MultiBotBridgeInternal.h"
 #include "MultiBotBridgeRoster.h"
 
-#include "PlayerbotMgr.h"
+#include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
 
 #include <sstream>
@@ -15,6 +15,93 @@ char const* const kOpcodeRoster = "ROSTER";
 char const* const kOpcodeAccountRoster = "ACCOUNT_ROSTER";
 char const* const kOpcodeGuildRoster = "GUILD_ROSTER";
 char const* const kOpcodeFriendRoster = "FRIEND_ROSTER";
+
+struct BotEntry
+{
+    std::string name;
+    uint8 cls;
+    uint8 level;
+};
+
+std::vector<BotEntry> ListAccountBots(uint32 accountId)
+{
+    std::vector<BotEntry> entries;
+    QueryResult results = CharacterDatabase.Query("SELECT class, name, level FROM characters WHERE account = {}", accountId);
+    if (results)
+    {
+        do
+        {
+            Field* fields = results->Fetch();
+            uint8 cls = fields[0].Get<uint8>();
+            std::string name = fields[1].Get<std::string>();
+            uint8 level = fields[2].Get<uint8>();
+            entries.push_back({name, cls, level});
+        } while (results->NextRow());
+    }
+    return entries;
+}
+
+std::vector<BotEntry> ListLinkedAccountBots(uint32 masterAccountId)
+{
+    std::vector<BotEntry> entries;
+    if (!sPlayerbotAIConfig.allowTrustedAccountBots)
+        return entries;
+    QueryResult result = PlayerbotsDatabase.Query(
+        "SELECT linked_account_id FROM playerbots_account_links WHERE account_id = {}", masterAccountId);
+    if (!result)
+        return entries;
+    do
+    {
+        uint32 linkedAccountId = result->Fetch()[0].Get<uint32>();
+        std::vector<BotEntry> linked = ListAccountBots(linkedAccountId);
+        entries.insert(entries.end(), linked.begin(), linked.end());
+    } while (result->NextRow());
+    return entries;
+}
+
+std::vector<BotEntry> ListGuildBots(uint32 guildId)
+{
+    std::vector<BotEntry> entries;
+    if (!sPlayerbotAIConfig.allowGuildBots)
+        return entries;
+    QueryResult results = CharacterDatabase.Query(
+        "SELECT c.name, c.class, c.level FROM characters c"
+        " INNER JOIN guild_member gm ON gm.guid = c.guid"
+        " WHERE gm.guildid = {}", guildId);
+    if (results)
+    {
+        do
+        {
+            Field* fields = results->Fetch();
+            std::string name = fields[0].Get<std::string>();
+            uint8 cls = fields[1].Get<uint8>();
+            uint8 level = fields[2].Get<uint8>();
+            entries.push_back({name, cls, level});
+        } while (results->NextRow());
+    }
+    return entries;
+}
+
+std::vector<BotEntry> ListFriendBots(ObjectGuid playerGuid)
+{
+    std::vector<BotEntry> entries;
+    QueryResult results = CharacterDatabase.Query(
+        "SELECT c.name, c.class, c.level FROM characters c"
+        " INNER JOIN character_social cs ON cs.friend = c.guid"
+        " WHERE cs.guid = {} AND cs.flags = 1", playerGuid.GetCounter());
+    if (results)
+    {
+        do
+        {
+            Field* fields = results->Fetch();
+            std::string name = fields[0].Get<std::string>();
+            uint8 cls = fields[1].Get<uint8>();
+            uint8 level = fields[2].Get<uint8>();
+            entries.push_back({name, cls, level});
+        } while (results->NextRow());
+    }
+    return entries;
+}
 
 } // namespace
 
@@ -39,18 +126,14 @@ void SendRosterPacket(Player* player, ChatMsg replyType)
 
 void SendAccountRosterPacket(Player* player, ChatMsg replyType)
 {
-    PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
-    if (!mgr)
-        return;
-
     uint32 const masterAccountId = player->GetSession()->GetAccountId();
 
     std::ostringstream out;
     bool first = true;
 
-    auto appendEntries = [&](std::vector<PlayerbotHolder::BotEntry> const& entries)
+    auto appendEntries = [&](std::vector<BotEntry> const& entries)
     {
-        for (PlayerbotHolder::BotEntry const& entry : entries)
+        for (BotEntry const& entry : entries)
         {
             if (!first)
                 out << ';';
@@ -59,18 +142,14 @@ void SendAccountRosterPacket(Player* player, ChatMsg replyType)
         }
     };
 
-    appendEntries(mgr->ListAccountBots(masterAccountId));
-    appendEntries(mgr->ListLinkedAccountBots(masterAccountId));
+    appendEntries(ListAccountBots(masterAccountId));
+    appendEntries(ListLinkedAccountBots(masterAccountId));
 
     SendAddonPacket(player, replyType, kOpcodeAccountRoster, out.str());
 }
 
 void SendGuildRosterPacket(Player* player, ChatMsg replyType)
 {
-    PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
-    if (!mgr)
-        return;
-
     uint32 const guildId = player->GetGuildId();
     if (!guildId)
     {
@@ -81,7 +160,7 @@ void SendGuildRosterPacket(Player* player, ChatMsg replyType)
     std::ostringstream out;
     bool first = true;
 
-    for (PlayerbotHolder::BotEntry const& entry : mgr->ListGuildBots(guildId))
+    for (BotEntry const& entry : ListGuildBots(guildId))
     {
         if (!first)
             out << ';';
@@ -94,14 +173,10 @@ void SendGuildRosterPacket(Player* player, ChatMsg replyType)
 
 void SendFriendRosterPacket(Player* player, ChatMsg replyType)
 {
-    PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
-    if (!mgr)
-        return;
-
     std::ostringstream out;
     bool first = true;
 
-    for (PlayerbotHolder::BotEntry const& entry : mgr->ListFriendBots(player->GetGUID()))
+    for (BotEntry const& entry : ListFriendBots(player->GetGUID()))
     {
         if (!first)
             out << ';';
