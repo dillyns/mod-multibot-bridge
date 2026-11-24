@@ -3,6 +3,7 @@
 
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
+#include "PlayerbotsDatabase.h"
 
 #include <sstream>
 #include <string>
@@ -44,7 +45,7 @@ std::vector<BotEntry> ListAccountBots(uint32 accountId)
 std::vector<BotEntry> ListLinkedAccountBots(uint32 masterAccountId)
 {
     std::vector<BotEntry> entries;
-    if (!sPlayerbotAIConfig.allowTrustedAccountBots)
+    if (!sPlayerbotAIConfig.AllowTrustedAccountBots)
         return entries;
     QueryResult result = PlayerbotsDatabase.Query(
         "SELECT linked_account_id FROM playerbots_account_links WHERE account_id = {}", masterAccountId);
@@ -62,7 +63,7 @@ std::vector<BotEntry> ListLinkedAccountBots(uint32 masterAccountId)
 std::vector<BotEntry> ListGuildBots(uint32 guildId)
 {
     std::vector<BotEntry> entries;
-    if (!sPlayerbotAIConfig.allowGuildBots)
+    if (!sPlayerbotAIConfig.AllowGuildBots)
         return entries;
     QueryResult results = CharacterDatabase.Query(
         "SELECT c.name, c.class, c.level FROM characters c"
@@ -110,7 +111,11 @@ void SendRosterPacket(Player* player, ChatMsg replyType)
     std::ostringstream out;
     bool first = true;
 
-    for (Player* const bot : GetBridgeVisibleBots(player))
+    std::vector<Player*> bots = GetBridgeVisibleBots(player);
+    if (IsSelfBot(player))
+        bots.insert(bots.begin(), player);
+
+    for (Player* const bot : bots)
     {
         if (!first)
             out << ';';

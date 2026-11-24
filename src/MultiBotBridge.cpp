@@ -2564,55 +2564,7 @@ bool ApplyNativeDisperseCommand(Player* bot, std::string const& command)
 
 bool IsAllowedCombatCommand(std::string const& command)
 {
-    std::string const normalized = ToUpper(Acore::String::Trim(command));
-
-    static std::set<std::string> const allowed =
-    {
-        "CO +FOCUS",
-        "CO -FOCUS",
-        "CO +DPS ASSIST",
-        "CO -DPS ASSIST",
-        "CO +AOE",
-        "CO -AOE",
-        "CO +DPS AOE",
-        "CO -DPS AOE",
-        "CO +TANK ASSIST",
-        "CO -TANK ASSIST",
-        "CO +AVOID AOE",
-        "CO -AVOID AOE",
-        "CO +SAVE MANA",
-        "CO -SAVE MANA",
-        "CO +THREAT",
-        "CO -THREAT",
-        "CO +BEHIND",
-        "CO -BEHIND",
-        "CO +WAIT FOR ATTACK",
-        "CO -WAIT FOR ATTACK"
-    };
-
-    if (allowed.find(normalized) != allowed.end())
-        return true;
-
-    static std::string const waitPrefix = "WAIT FOR ATTACK TIME ";
-    if (normalized.rfind(waitPrefix, 0) != 0)
-        return false;
-
-    std::string const value = Acore::String::Trim(normalized.substr(waitPrefix.size()));
-    if (value.empty())
-        return false;
-
-    uint32 seconds = 0;
-    for (char c : value)
-    {
-        if (!std::isdigit(static_cast<unsigned char>(c)))
-            return false;
-
-        seconds = (seconds * 10) + static_cast<uint32>(c - '0');
-        if (seconds > 60)
-            return false;
-    }
-
-    return true;
+    return ToUpper(Acore::String::Trim(command)).rfind("CO ", 0) == 0;
 }
 
 std::string NormalizeCombatCommand(std::string const& command)
@@ -3031,7 +2983,11 @@ std::string BuildStatePayload(Player* player, std::string const& botName)
 void SendStatePackets(Player* player, ChatMsg replyType)
 {
     bool sent = false;
-    for (Player* const bot : GetBridgeVisibleBots(player))
+    std::vector<Player*> bots = GetBridgeVisibleBots(player);
+    if (IsSelfBot(player))
+        bots.insert(bots.begin(), player);
+
+    for (Player* const bot : bots)
     {
         PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
         std::string combatStrategies;
